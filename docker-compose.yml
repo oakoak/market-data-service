@@ -8,6 +8,30 @@
 # to avoid Windows path/permission issues. Only source code / migration directories
 # are bind-mounted, using relative `./...` paths that Compose resolves the same way
 # on both platforms.
+#
+# Logging & monitoring (loki/grafana/prometheus/cadvisor): app/infra services ship
+# their stdout logs to Loki via the `loki` Docker logging driver -- a one-time host
+# setup step, see docs/07-local-dev.md. The driver runs at the Docker daemon level
+# (not inside a container's own network namespace), so `loki-url` targets Loki's
+# *published host port* over `localhost`, which resolves correctly whether the
+# daemon is native Linux or the Docker Desktop VM (both cases the daemon owns the
+# port it just published). Requires: `docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions`.
+#
+# Single entry point (traefik): the human-facing web UIs (api docs, grafana,
+# prometheus, cadvisor) are only reachable through Traefik on one published port
+# (${TRAEFIK_HOST_PORT:-80}), routed by Host header (`api.localhost`,
+# `grafana.localhost`, ...) -- browsers resolve *.localhost to 127.0.0.1 without
+# any /etc/hosts edits. Those 4 services no longer publish their own host ports;
+# they're still reachable container-to-container by name on market-data-net for
+# anything (e.g. prometheus -> cadvisor) that doesn't go through the proxy.
+# Data-plane services (redis, clickhouse, loki's push endpoint) keep their direct
+# ports since they're not meant to go through a human-facing reverse proxy.
+# Chosen over a bare Docker Compose port-per-service setup specifically because
+# Traefik auto-discovers routing from container labels (see `traefik.*` labels
+# below) -- add a service, add its labels, no central proxy config file to
+# hand-edit. This is also where a future unified-auth layer plugs in cleanly:
+# a single `traefik.http.middlewares.<name>.forwardauth.*` label added to each
+# of these 4 services' label blocks, no per-app auth code.
 
 networks:
   market-data-net:
@@ -17,6 +41,14 @@ networks:
 volumes:
   redis-data:
   clickhouse-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:
+
+x-loki-log-options: &loki-log-options
+  loki-url: "http://localhost:${LOKI_HOST_PORT:-3100}/loki/api/v1/push"
+  loki-retries: "3"
+  loki-batch-size: "400"
 
 services:
   redis:
@@ -34,6 +66,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=redis,project=market-data"
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8.6.70-alpine
@@ -58,6 +95,11 @@ services:
       timeout: 3s
       retries: 20
       start_period: 15s
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=clickhouse,project=market-data"
 
   collector:
     build:
@@ -79,6 +121,11 @@ services:
         condition: service_healthy
     networks:
       - market-data-net
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=collector,project=market-data"
 
   normalizer:
     build:
@@ -102,6 +149,11 @@ services:
         condition: service_healthy
     networks:
       - market-data-net
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data"
 
   api:
     build:
@@ -117,10 +169,106 @@ services:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-market_data}
-    ports:
-      - "${API_HOST_PORT:-8000}:8000"
     depends_on:
       clickhouse:
         condition: service_healthy
     networks:
       - market-data-net
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=api,project=market-data"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`api.localhost`)"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  loki:
+    image: grafana/loki:3.7.7
+    restart: unless-stopped
+    ports:
+      - "${LOKI_HOST_PORT:-3100}:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - market-data-net
+    # Loki's own container logs stay on the default json-file driver: sending them
+    # through the loki driver would create a bootstrap loop (Loki needs to be up to
+    # receive its own first log lines).
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.5
+    restart: unless-stopped
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+    networks:
+      - market-data-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.cadvisor.rule=Host(`cadvisor.localhost`)"
+      - "traefik.http.services.cadvisor.loadbalancer.server.port=8080"
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    restart: unless-stopped
+    volumes:
+      - ./infra/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - cadvisor
+    networks:
+      - market-data-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.localhost`)"
+      - "traefik.http.services.prometheus.loadbalancer.server.port=9090"
+
+  grafana:
+    image: grafana/grafana:13.0.8
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/market-data-overview.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - market-data-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.localhost`)"
+      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+
+  traefik:
+    image: traefik:v3.7.12
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=market-data-net
+      - --entrypoints.web.address=:80
+      - --api.dashboard=true
+    ports:
+      - "${TRAEFIK_HOST_PORT:-80}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - market-data-net
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=traefik,project=market-data"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.localhost`)"
+      - "traefik.http.routers.traefik.service=api@internal"

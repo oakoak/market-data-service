@@ -10,6 +10,7 @@ are never string-interpolated into SQL.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -259,8 +260,6 @@ async def list_incidents(
     """
     result = await client.query(query, parameters=params)
     rows = _rows(result)
-    import json
-
     for row in rows:
         # `details` is a JSON-serialized String column (ClickHouse's native
         # JSON type is experimental/disabled on the pinned 24.8 server, see
