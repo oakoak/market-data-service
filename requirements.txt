@@ -18,3 +18,20 @@ httpx==0.27.2
 # aiohttp, required by clickhouse_connect.driver.asyncclient.AsyncClient.
 clickhouse-connect[async]==1.7.2
 aiohttp==3.10.10
+
+# API prototype dependencies (REST + MCP serving layer,
+# docs/04-architecture/00-overview.md §6.3).
+# Versions checked against PyPI at implementation time (2026-09-13); pinned one
+# minor release back from the then-current latest per project convention:
+#   fastapi latest 0.141.1 (2026-07-29) -> pinned 0.140.13 (last 0.140.x patch)
+#   uvicorn latest 0.52.4  (2026-08-19) -> pinned 0.51.0  (last 0.51.x release)
+# `mcp` (official Anthropic MCP Python SDK) is pinned to the 1.x line, not the
+# newer 2.x line (latest 2.2.0) -- mcp 2.0 renamed `FastMCP` to `MCPServer` and
+# changed the mounting API (confirmed by importing 2.1.1 in a scratch venv:
+# `mcp.server.fastmcp` raises ModuleNotFoundError with a migration-guide
+# pointer), which this codebase's design (mcp.server.fastmcp.FastMCP,
+# .streamable_http_app()) relies on. 1.30.0 (2026-09-07) was <1 week old at
+# pin time, so pinned one release back: 1.29.1 (2026-08-24).
+fastapi==0.140.13
+uvicorn==0.51.0
+mcp==1.29.1

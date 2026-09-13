@@ -1,7 +1,7 @@
-# Local prototype stack: redis (broker) + clickhouse (storage) + collector + normalizer.
+# Local prototype stack: redis (broker) + clickhouse (storage) + collector + normalizer + api.
 #
 # Deliberately cut down per docs/03-mvp-scope.md: single exchange/segment/symbol
-# (Binance spot BTCUSDT), no API/MCP service yet. See docs/07-local-dev.md.
+# (Binance spot BTCUSDT). See docs/07-local-dev.md.
 #
 # Cross-platform note (Windows Docker Desktop + Linux dev, same compose file):
 # stateful data (Redis, ClickHouse) lives in named volumes, not host bind-mounts,
@@ -98,6 +98,28 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - market-data-net
+
+  api:
+    build:
+      context: .
+      dockerfile: ./src/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      EXCHANGE: ${EXCHANGE:-binance}
+      SEGMENT: ${SEGMENT:-spot}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-market_data}
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
       clickhouse:
         condition: service_healthy
     networks:
