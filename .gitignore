@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.log
+.secondstack/
+clickhouse-data/
+redis-data/
+.DS_Store

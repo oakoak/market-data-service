@@ -1,0 +1,18 @@
+# Collector prototype dependencies.
+# Pinned per project convention: a stable version at least ~1 week old /
+# one minor release back from bleeding edge, not the latest release.
+
+# WS client (docs/04-architecture/01-stack.md: `websockets`, not `aiohttp`).
+websockets==13.1
+
+# Redis Streams broker client with asyncio support (`redis.asyncio`).
+redis==5.0.8
+
+# REST snapshot fetch (GET /api/v3/depth) -- async HTTP client.
+httpx==0.27.2
+
+# Normalizer prototype dependencies.
+# ClickHouse client (docs/04-architecture/01-stack.md: `clickhouse-connect`,
+# native asyncio since 0.12.0). Pinned one minor release back from the
+# current latest (1.8.0) per project convention.
+clickhouse-connect==1.7.2

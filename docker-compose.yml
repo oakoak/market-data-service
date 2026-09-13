@@ -1,0 +1,104 @@
+# Local prototype stack: redis (broker) + clickhouse (storage) + collector + normalizer.
+#
+# Deliberately cut down per docs/03-mvp-scope.md: single exchange/segment/symbol
+# (Binance spot BTCUSDT), no API/MCP service yet. See docs/07-local-dev.md.
+#
+# Cross-platform note (Windows Docker Desktop + Linux dev, same compose file):
+# stateful data (Redis, ClickHouse) lives in named volumes, not host bind-mounts,
+# to avoid Windows path/permission issues. Only source code / migration directories
+# are bind-mounted, using relative `./...` paths that Compose resolves the same way
+# on both platforms.
+
+networks:
+  market-data-net:
+    name: market-data-net
+    driver: bridge
+
+volumes:
+  redis-data:
+  clickhouse-data:
+
+services:
+  redis:
+    image: redis:7.4.1-alpine
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - market-data-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8.6.70-alpine
+    restart: unless-stopped
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      # Numeric filename prefixes (001_/002_/003_/004_) guarantee execution order.
+      # Mount the whole migrations/ dir as the image's init.d hook (read-only).
+      - ./infra/clickhouse/migrations:/docker-entrypoint-initdb.d:ro
+    networks:
+      - market-data-net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  collector:
+    build:
+      context: .
+      dockerfile: ./src/collector/Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_STREAM_DB: ${REDIS_STREAM_DB:-1}
+      EXCHANGE: ${EXCHANGE:-binance}
+      SEGMENT: ${SEGMENT:-spot}
+      SYMBOL: ${SYMBOL:-BTCUSDT}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1000000}
+      BACKOFF_INITIAL_S: ${BACKOFF_INITIAL_S:-1}
+      BACKOFF_MAX_S: ${BACKOFF_MAX_S:-60}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - market-data-net
+
+  normalizer:
+    build:
+      context: .
+      dockerfile: ./src/normalizer/Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      REDIS_STREAM_DB: ${REDIS_STREAM_DB:-1}
+      EXCHANGE: ${EXCHANGE:-binance}
+      SEGMENT: ${SEGMENT:-spot}
+      SYMBOL: ${SYMBOL:-BTCUSDT}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-market_data}
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - market-data-net
