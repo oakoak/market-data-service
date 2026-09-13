@@ -19,6 +19,7 @@ import json
 import random
 from typing import Any
 
+import redis.exceptions
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -46,23 +47,26 @@ class CollectorRunner:
         dropping while the process stays up)."""
         await self._sink.connect()
         backoff = self._config.backoff_initial_s
-        first_attempt = True
+        recovering = False
         try:
             while True:
-                if not first_attempt:
-                    await self._emit_signal("reconnect", {"attempt": True})
-                first_attempt = False
                 try:
-                    await self._connect_and_stream()
+                    await self._connect_and_stream(emit_reconnect_signal=recovering)
                     # A clean return (shouldn't normally happen) still counts
                     # as a disconnect from the runner's perspective.
                     backoff = self._config.backoff_initial_s
-                except (ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
+                except (
+                    ConnectionClosed,
+                    OSError,
+                    asyncio.TimeoutError,
+                    redis.exceptions.RedisError,
+                ) as exc:
                     log.warning(
                         "ws disconnected, will reconnect",
                         extra={"error": str(exc), "backoff_s": backoff},
                     )
                     await self._emit_signal("disconnect", {"error": str(exc)})
+                    recovering = True
                     jitter = random.uniform(0, backoff * 0.1)
                     await asyncio.sleep(backoff + jitter)
                     backoff = min(backoff * 2, self._config.backoff_max_s)
@@ -86,7 +90,7 @@ class CollectorRunner:
         except Exception:  # noqa: BLE001 - never let a signal-publish failure crash the loop
             log.exception("failed to publish %s signal", kind)
 
-    async def _connect_and_stream(self) -> None:
+    async def _connect_and_stream(self, emit_reconnect_signal: bool = False) -> None:
         url = self._adapter.ws_url()
         log.info("connecting", extra={"url": url})
 
@@ -103,9 +107,19 @@ class CollectorRunner:
             ping_interval=20,
             ping_timeout=20,
             open_timeout=10,
-            max_queue=None,
+            # Bound the receive queue so a slow Redis publish side applies
+            # backpressure (via TCP, once this fills) instead of letting
+            # `websockets` buffer unread messages in memory without limit.
+            max_queue=2048,
         ) as ws:
             log.info("connected", extra={"url": url})
+            if emit_reconnect_signal:
+                # Only now that the WS connection is actually back up do we
+                # tell the normalizer we've reconnected -- emitting this
+                # earlier (e.g. right before the connect attempt) would
+                # resolve the `collector_disconnect` incident prematurely if
+                # this very attempt goes on to fail too.
+                await self._emit_signal("reconnect", {"attempt": True})
             snapshot_task = asyncio.create_task(self._bootstrap_snapshot())
             recv_task: asyncio.Task[Any] | None = None
 

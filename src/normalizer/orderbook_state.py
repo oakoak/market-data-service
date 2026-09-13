@@ -65,6 +65,10 @@ class OrderBookState:
     last_update_id: int | None = None
     ready: bool = False  # True once a snapshot has been applied
     awaiting_resync: bool = False  # True after a detected sequence break
+    # False right after apply_snapshot() until the anchor event (binance.md
+    # step 4: U <= lastUpdateId+1 <= u) has been accepted; True afterwards,
+    # at which point the strict per-event continuity check (step 5) applies.
+    _bootstrapped: bool = False
 
     def apply_snapshot(self, row: dict[str, Any]) -> None:
         """`row` is a parser.parse_snapshot(...) output dict."""
@@ -73,6 +77,7 @@ class OrderBookState:
         self.last_update_id = row["last_update_id"]
         self.ready = True
         self.awaiting_resync = False
+        self._bootstrapped = False
 
     def apply_diff(self, row: dict[str, Any]) -> SequenceBreak | None:
         """`row` is a parser.parse_depth_diff(...) output dict.
@@ -86,6 +91,20 @@ class OrderBookState:
         still stored to ClickHouse by the caller regardless -- raw diff
         history is always persisted per docs §6.5, only *book state*
         reconstruction pauses).
+
+        Bootstrap handling (binance.md steps 3-5): right after a snapshot is
+        applied, the first event is not held to the strict `U == prev.u + 1`
+        continuity rule (that's a general-purpose comparison to a *previous
+        event*, and there is no previous event yet). Instead:
+          - events that predate the snapshot (`u <= lastUpdateId`) are stale
+            and silently discarded (not a break, not applied);
+          - the first non-stale event must straddle the snapshot
+            (`U <= lastUpdateId+1 <= u`) to be accepted as the anchor;
+          - anything else at this stage (e.g. a gap where even the first
+            available event's `U` is already past `lastUpdateId+1`) is a
+            genuine sequence break.
+        Once the anchor has been accepted, `_bootstrapped` is True and every
+        subsequent event goes through the strict `U == prev.u + 1` check.
         """
         if not self.ready or self.awaiting_resync:
             return None
@@ -93,8 +112,34 @@ class OrderBookState:
         first_update_id = row["first_update_id"]
         final_update_id = row["final_update_id"]
 
-        # binance.md step 5, spot: current.U == previous.u + 1
         assert self.last_update_id is not None
+
+        if not self._bootstrapped:
+            # binance.md step 3: discard events that predate the snapshot.
+            if final_update_id <= self.last_update_id:
+                return None
+
+            # binance.md step 4: the first applied event must straddle the
+            # snapshot's lastUpdateId -- checked once, as a range, not with
+            # equality.
+            if first_update_id <= self.last_update_id + 1 <= final_update_id:
+                self._apply_levels(self._bids, row["bids"])
+                self._apply_levels(self._asks, row["asks"])
+                self.last_update_id = final_update_id
+                self._bootstrapped = True
+                return None
+
+            # Neither stale nor a valid straddle -- there's a gap between
+            # the snapshot and the earliest available diff event.
+            brk = SequenceBreak(
+                last_valid_update_id=self.last_update_id,
+                received_update_id_u=final_update_id,
+                received_update_id_U=first_update_id,
+            )
+            self.awaiting_resync = True
+            return brk
+
+        # binance.md step 5, spot: current.U == previous.u + 1
         if first_update_id != self.last_update_id + 1:
             brk = SequenceBreak(
                 last_valid_update_id=self.last_update_id,
