@@ -133,12 +133,14 @@ class ClickHouseSink:
             await self._client.close()
 
     async def _periodic_flush(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(self._flush_interval_s)
+        while True:
+            await asyncio.sleep(self._flush_interval_s)
+            try:
                 await self.flush_all()
-        except asyncio.CancelledError:
-            raise
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("periodic flush failed, will retry on next tick")
 
     async def flush_all(self) -> None:
         for table in list(self._buffers):

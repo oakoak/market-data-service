@@ -40,11 +40,12 @@ CREATE TABLE IF NOT EXISTS market_data.incidents
     detected_by      String,                               -- detector/rule name or system id
 
     -- type- and exchange-specific payload; always includes `source_channel`.
-    -- Stored as ClickHouse's native JSON type for queryability (details.source_channel,
-    -- details.last_valid_update_id, etc.) without a separate parsing step. If the target
-    -- ClickHouse version does not support the JSON type, fall back to `String` and
-    -- serialize/deserialize as JSON text in the application layer.
-    details          JSON,
+    -- Stored as a JSON-text String: ClickHouse's native JSON type is experimental
+    -- and disabled by default (would require `allow_experimental_json_type=1`)
+    -- on the pinned 24.8 server, so the application layer (normalizer) serializes/
+    -- deserializes this as JSON text instead. Query with `JSONExtractString(details, 'source_channel')`
+    -- or similar, or use ClickHouse's `simpleJSON*`/`JSONExtract*` functions.
+    details          String,
 
     ingested_at      DateTime64(3, 'UTC') DEFAULT now64(3) CODEC(Delta, ZSTD)
 )
