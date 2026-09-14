@@ -23,12 +23,35 @@ snapshot-applied is lost) holds exactly as before: buffering starts at the
 same instant the snapshot fetch is kicked off, before this first message is
 even done being handled.
 
+**Multi-symbol (2026-09 Phase A, docs/08-prototype-roadmap.md):** a single
+named connection can now also carry messages for *every* symbol an adapter
+was configured with (`ExchangeAdapter.symbols`), interleaved -- Binance
+spot's combined connection is the case in point: one `/stream?streams=...`
+socket multiplexes `{symbol}@trade` + `{symbol}@depth@100ms` for the whole
+symbol list, not just one symbol. The buffer-until-snapshot-ready dance
+therefore has to be keyed **per (connection, symbol)**, not just per
+connection: BTCUSDT's first depth_diff on the combined connection kicks off
+BTCUSDT's own REST snapshot fetch and buffers only BTCUSDT's depth diffs
+while it's in flight; ETHUSDT's first depth_diff on that same connection
+does the exact same dance completely independently, concurrently, with its
+own buffer and its own snapshot task. Which symbol an incoming message
+belongs to is resolved via `ExchangeAdapter.symbol_of()`; per-symbol state
+lives in a local `dict[str, _SymbolBufferState]` inside `_connect_and_stream`
+(see that method), so it's naturally re-initialized fresh on every
+reconnect, same as the old connection-scoped scalars were. Stream names
+follow the same per-symbol split: `Config.stream_prefix()` now takes the
+symbol explicitly, so this module never precomputes a single
+`self._trades_stream`/`self._depth_stream`/etc. in `__init__` any more --
+see `_stream_for()`.
+
 An adapter can also declare periodic REST-only pollers
 (`ExchangeAdapter.rest_pollers()`, e.g. Binance Open Interest, which has no
 WS stream at all). Each declared poller runs as its own independent
 interval-loop task and publishes its raw result through the same
 `RedisStreamSink` used for WS messages, tagged with the poller's own name as
-`type` so downstream consumers can tell REST-poll results apart.
+`type` so downstream consumers can tell REST-poll results apart. A poller
+result isn't inherently "about" one symbol out of a multi-symbol adapter's
+list (see `_run_rest_poller` for how that ambiguity is resolved today).
 
 Explicitly NOT owned here (per task scope): sequence-break / gap detection,
 incident records, unified-schema parsing -- all normalizer responsibilities.
@@ -42,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+from dataclasses import dataclass, field
 from typing import Any
 
 import redis.exceptions
@@ -56,24 +80,33 @@ from common import get_logger
 log = get_logger("collector.runner")
 
 
+@dataclass
+class _SymbolBufferState:
+    """Depth-diff buffer-until-snapshot-ready state for one symbol on one
+    connection, for the lifetime of one connect attempt (scoped inside
+    `_connect_and_stream`, so it's discarded and rebuilt fresh on every
+    reconnect -- same lifetime the old connection-scoped scalars had, just
+    now one instance per symbol instead of one set of scalars per
+    connection). `snapshot_task` staying non-None after the snapshot is
+    applied (see `_connect_and_stream`) is what prevents a second snapshot
+    fetch for the same symbol on the same connect attempt -- mirrors the old
+    single-scalar behavior exactly, just keyed by symbol now."""
+
+    buffering: bool = False
+    buffer: list[dict[str, Any]] = field(default_factory=list)
+    snapshot_task: "asyncio.Task[dict[str, Any]] | None" = None
+
+
 class CollectorRunner:
     def __init__(self, config: Config, adapter: ExchangeAdapter, sink: RedisStreamSink) -> None:
         self._config = config
         self._adapter = adapter
         self._sink = sink
-        self._trades_stream = f"{config.stream_prefix}:trades"
-        self._depth_stream = f"{config.stream_prefix}:depth"
-        # New stream for REST-poll results (Open Interest and similar) --
-        # kept separate from trades/depth so an adapter with no pollers
-        # doesn't need it, and so normalizer-side wiring for it is additive.
-        self._poll_stream = f"{config.stream_prefix}:poll"
-        # Fallback stream for messages whose stream_type() is falsy/"unknown"
-        # -- i.e. genuinely unclassifiable, not just "a kind other than
-        # depth_diff/trade". Every other classification gets its own stream
-        # (see `_stream_for_kind`) so normalizer consumers can subscribe
-        # per-kind without the runner needing to know exchange-specific
-        # kind names.
-        self._other_stream = f"{config.stream_prefix}:other"
+        # No precomputed stream names here any more: `Config.stream_prefix()`
+        # is now symbol-parameterized (Phase A), and since one connection can
+        # carry many symbols' messages interleaved, the right stream name
+        # can only be known once a given message's symbol has been resolved.
+        # See `_stream_for()`, computed per message instead.
 
     async def run(self) -> None:
         """Top-level: connect to Redis once, then run one independent task
@@ -155,15 +188,29 @@ class CollectorRunner:
         while True:
             try:
                 result = await poll_fn()
+                # A poller result isn't inherently "about" one symbol out of
+                # a multi-symbol adapter's `config.symbols` list -- neither
+                # `ExchangeAdapter.rest_pollers()` nor a poll_fn's return
+                # value tells the runner which symbol(s) a given result
+                # covers, and generalizing that is out of scope here.
+                # Flagging rather than silently guessing further: today this
+                # is a non-issue in practice, since the only adapter with
+                # pollers (USDT-M perp) is still strictly single-symbol
+                # (`config.symbols` always has exactly one entry there) and
+                # the only multi-symbol adapter (spot) declares no pollers
+                # at all. `config.symbols[0]` is therefore always correct
+                # today; a genuinely multi-symbol poller adapter would need
+                # `rest_pollers()` to say which symbol(s) each poller covers.
+                symbol = self._config.symbols[0]
                 message = {
                     "type": name,
                     "receive_ts": now_ts_ms(),
                     "exchange": self._adapter.exchange,
                     "segment": self._adapter.segment,
-                    "symbol": self._adapter.symbol,
+                    "symbol": symbol,
                     "raw": result,
                 }
-                await self._sink.publish(self._poll_stream, message)
+                await self._sink.publish(f"{self._config.stream_prefix(symbol)}:poll", message)
             except Exception:  # noqa: BLE001 - one poller's failure must not kill the others
                 log.exception("rest poller failed", extra={"poller": name})
             await asyncio.sleep(interval_s)
@@ -171,23 +218,35 @@ class CollectorRunner:
     async def _emit_signal(self, connection: str, kind: str, details: dict[str, Any]) -> None:
         """Push a raw disconnect/reconnect signal event so the normalizer can
         create a `collector_disconnect` incident -- the collector itself does
-        not compute incidents (docs/04-architecture/00-overview.md §6.3.1).
+        not compute incidents (docs/04-architecture/00-overview.md section 6.3.1).
         `connection` (the named WS connection this signal came from) is
         included in `raw` so the normalizer can eventually disambiguate
         concurrent disconnects across multiple connections -- today's
         `NormalizerContext` still tracks a single open disconnect incident
         at a time (see memory/collector.md), that's a normalizer-side
-        follow-up, not fixed here."""
+        follow-up, not fixed here.
+
+        Same symbol ambiguity as `_run_rest_poller` above: a disconnect/
+        reconnect is a per-connection connectivity event, not inherently
+        about one symbol, but the payload shape still carries a `symbol`
+        field and needs one concrete stream to land on. Use
+        `config.symbols[0]` as a defensible default -- neither adapter that
+        exists today needs anything more precise (USDT-M perp is
+        single-symbol; spot's combined connection has no pollers/signals
+        ambiguity in practice since this path only fires on WS
+        disconnect/reconnect, not per-message). Flagging rather than
+        silently engineering a fuller per-symbol signal scheme."""
+        symbol = self._config.symbols[0]
         message = {
             "type": kind,
             "receive_ts": now_ts_ms(),
             "exchange": self._adapter.exchange,
             "segment": self._adapter.segment,
-            "symbol": self._adapter.symbol,
+            "symbol": symbol,
             "raw": {**details, "connection": connection},
         }
         try:
-            await self._sink.publish(self._depth_stream, message)
+            await self._sink.publish(self._stream_for(symbol, "depth_diff"), message)
         except Exception:  # noqa: BLE001 - never let a signal-publish failure crash the loop
             log.exception("failed to publish %s signal", kind)
 
@@ -198,17 +257,21 @@ class CollectorRunner:
 
         # Depth-diff buffering state for the snapshot bootstrap/reconcile
         # dance (binance.md steps 1-4), scoped to this one connection and
-        # this one connect attempt. Unlike the old single-connection runner,
-        # the snapshot fetch is *not* kicked off unconditionally at connect
-        # time -- it starts lazily on this connection's first depth_diff
-        # message (see module docstring). Buffering starts at that exact
-        # same instant, so the "nothing lost between WS-open and
-        # snapshot-applied" guarantee still holds; a connection that never
-        # sees a depth_diff (e.g. USDT-M perp's `/market`) never fetches a
-        # snapshot at all.
-        buffering = False
-        buffer: list[dict[str, Any]] = []
-        snapshot_task: asyncio.Task[dict[str, Any]] | None = None
+        # this one connect attempt -- and, since Phase A, keyed *per symbol*
+        # within that: `symbol_states[symbol]` holds that symbol's own
+        # buffering flag, buffer, and snapshot task, completely independent
+        # of every other symbol multiplexed over this same connection. The
+        # snapshot fetch for a given symbol is not kicked off unconditionally
+        # at connect time -- it starts lazily the moment *that symbol's*
+        # first depth_diff message arrives (see module docstring). Buffering
+        # for that symbol starts at that exact same instant, so the "nothing
+        # lost between WS-open and snapshot-applied" guarantee still holds
+        # per symbol; a symbol that never appears in a depth_diff on this
+        # connection (shouldn't happen for symbols actually in
+        # `self._adapter.symbols`, but e.g. USDT-M perp's `/market`
+        # connection never carries depth diffs for its one symbol at all)
+        # never fetches a snapshot.
+        symbol_states: dict[str, _SymbolBufferState] = {}
 
         async with websockets.connect(
             url,
@@ -235,19 +298,41 @@ class CollectorRunner:
                     if recv_task is None:
                         recv_task = asyncio.create_task(ws.recv())
 
-                    waitables = {recv_task}
-                    if buffering and snapshot_task is not None:
-                        waitables.add(snapshot_task)
+                    # Wait on the recv task *and* every symbol's currently-
+                    # pending snapshot task on this connection -- with
+                    # several symbols multiplexed over one connection,
+                    # multiple snapshot fetches can legitimately be in
+                    # flight at once (e.g. BTCUSDT's and ETHUSDT's both
+                    # kicked off moments apart), each needing to be applied
+                    # the instant it completes regardless of whether a new
+                    # WS message happens to arrive at the same time.
+                    waitables: set[asyncio.Task[Any]] = {recv_task}
+                    for state in symbol_states.values():
+                        if state.buffering and state.snapshot_task is not None:
+                            waitables.add(state.snapshot_task)
 
                     done, _ = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
 
-                    # Apply the snapshot as soon as it's ready, independent of
-                    # whether a new WS message has arrived -- otherwise a
-                    # quiet stream could leave it un-applied indefinitely.
-                    if buffering and snapshot_task is not None and snapshot_task in done:
-                        await self._apply_snapshot(name, snapshot_task, buffer)
-                        buffering = False
-                        buffer = []
+                    # Apply any symbol's snapshot as soon as it's ready,
+                    # independent of whether a new WS message has arrived --
+                    # otherwise a quiet stream could leave it un-applied
+                    # indefinitely. Iterate over a snapshot of the items
+                    # since nothing here mutates symbol_states' keys, only
+                    # the per-symbol state objects' fields.
+                    for symbol, state in symbol_states.items():
+                        if (
+                            state.buffering
+                            and state.snapshot_task is not None
+                            and state.snapshot_task in done
+                        ):
+                            await self._apply_snapshot(name, symbol, state.snapshot_task, state.buffer)
+                            state.buffering = False
+                            state.buffer = []
+                            # state.snapshot_task is intentionally left set
+                            # (not reset to None) -- it's what prevents a
+                            # second snapshot fetch for this symbol on this
+                            # same connect attempt, mirroring the old
+                            # connection-scoped `snapshot_task is None` gate.
 
                     if recv_task in done:
                         raw_text = recv_task.result()
@@ -265,52 +350,80 @@ class CollectorRunner:
                             else "unknown"
                         )
 
+                        # Resolve which symbol this message belongs to via
+                        # the adapter's own envelope parsing -- only
+                        # meaningful for a dict message that actually came
+                        # through the exchange's combined-stream envelope.
+                        # The non-JSON `_raw_text` fallback above has no
+                        # `stream`/envelope field for `symbol_of()` to parse,
+                        # so it can't be attributed to a real symbol; fall
+                        # back to this connection's first configured symbol
+                        # so the message still lands on *a* well-defined
+                        # stream instead of being dropped (dumb-collector
+                        # "never drop a raw message" rule still applies to
+                        # this rare, genuinely-unparseable case).
+                        if isinstance(message, dict) and "_raw_text" not in message:
+                            symbol = self._adapter.symbol_of(message)
+                        else:
+                            symbol = self._adapter.symbols[0]
+
+                        state = symbol_states.setdefault(symbol, _SymbolBufferState())
+
                         # Every classification gets published -- the
                         # buffer-until-snapshot-ready dance is the ONLY
                         # thing special-cased to "depth_diff"; every other
                         # kind (including exchange-specific ones the runner
                         # has never heard of, e.g. "mark_price",
                         # "liquidation") is forwarded untouched to its own
-                        # stream. A connection carrying a mix of kinds (e.g.
-                        # USDT-M perp's "market" connection: aggTrade +
-                        # markPrice + kline) must not let a non-depth_diff
-                        # message affect the depth_diff buffering state.
-                        if kind == "depth_diff" and snapshot_task is None:
-                            # First depth_diff seen on this connection since
-                            # (re)connect -- lazily start the
-                            # bootstrap/reconcile dance now.
-                            snapshot_task = asyncio.create_task(self._bootstrap_snapshot())
-                            buffering = True
-                        if kind == "depth_diff" and buffering:
+                        # stream. A connection carrying a mix of kinds and
+                        # symbols (e.g. spot's combined connection: BTCUSDT
+                        # trades, BTCUSDT depth diffs, ETHUSDT trades,
+                        # ETHUSDT depth diffs, all interleaved) must not let
+                        # a non-depth_diff message, or another symbol's
+                        # depth_diff, affect this symbol's buffering state.
+                        if kind == "depth_diff" and state.snapshot_task is None:
+                            # First depth_diff seen for *this symbol* on
+                            # this connection since (re)connect -- lazily
+                            # start that symbol's bootstrap/reconcile dance
+                            # now.
+                            state.snapshot_task = asyncio.create_task(
+                                self._bootstrap_snapshot(symbol)
+                            )
+                            state.buffering = True
+                        if kind == "depth_diff" and state.buffering:
                             # Never drop; every raw message still gets
-                            # published even while we accumulate the
-                            # pre-snapshot buffer, per the "pass every raw
-                            # message through untouched" requirement.
-                            buffer.append({"receive_ts": receive_ts, "message": message})
+                            # published even while we accumulate this
+                            # symbol's pre-snapshot buffer, per the "pass
+                            # every raw message through untouched"
+                            # requirement.
+                            state.buffer.append({"receive_ts": receive_ts, "message": message})
 
                         if not kind or kind == "unknown":
                             log.debug(
                                 "unclassified message",
                                 extra={
                                     "connection": name,
+                                    "symbol": symbol,
                                     "stream": message.get("stream")
                                     if isinstance(message, dict)
                                     else None,
                                 },
                             )
-                        await self._publish(kind, message, receive_ts)
+                        await self._publish(symbol, kind, message, receive_ts)
             finally:
                 if recv_task is not None:
                     recv_task.cancel()
-                if snapshot_task is not None and not snapshot_task.done():
-                    snapshot_task.cancel()
+                for state in symbol_states.values():
+                    if state.snapshot_task is not None and not state.snapshot_task.done():
+                        state.snapshot_task.cancel()
 
-    async def _bootstrap_snapshot(self) -> dict[str, Any]:
-        return await self._adapter.fetch_snapshot()
+    async def _bootstrap_snapshot(self, symbol: str) -> dict[str, Any]:
+        return await self._adapter.fetch_snapshot(symbol)
 
     async def _apply_snapshot(
         self,
         connection: str,
+        symbol: str,
         snapshot_task: "asyncio.Task[dict[str, Any]]",
         buffer: list[dict[str, Any]],
     ) -> None:
@@ -319,11 +432,17 @@ class CollectorRunner:
         `snapshot` type message" requirement. The discard-events-with-u<=
         lastUpdateId / continuity bookkeeping is the normalizer's job -- the
         collector has already published every buffered event untouched by
-        this point, it just also tags the snapshot's arrival."""
+        this point, it just also tags the snapshot's arrival. Scoped to one
+        symbol now, not the whole connection -- each symbol multiplexed on a
+        connection gets its own `snapshot` message on its own depth stream
+        the moment *its* snapshot fetch completes."""
         try:
             snapshot = snapshot_task.result()
         except Exception:  # noqa: BLE001
-            log.exception("snapshot fetch failed; depth stream continues unsnapshotted for now")
+            log.exception(
+                "snapshot fetch failed; depth stream continues unsnapshotted for now",
+                extra={"connection": connection, "symbol": symbol},
+            )
             return
 
         message = {
@@ -331,52 +450,55 @@ class CollectorRunner:
             "receive_ts": now_ts_ms(),
             "exchange": self._adapter.exchange,
             "segment": self._adapter.segment,
-            "symbol": self._adapter.symbol,
+            "symbol": symbol,
             "raw": snapshot,
         }
-        await self._sink.publish(self._depth_stream, message)
+        await self._sink.publish(self._stream_for(symbol, "depth_diff"), message)
         log.info(
             "snapshot applied",
             extra={
                 "connection": connection,
+                "symbol": symbol,
                 "last_update_id": snapshot.get("lastUpdateId"),
                 "buffered_during_fetch": len(buffer),
             },
         )
 
-    def _stream_for_kind(self, kind: str) -> str:
-        """Route a `stream_type()` classification to a Redis stream name.
-        `depth_diff`/`trade` keep their existing dedicated stream names
-        unchanged (the normalizer already consumes those two specifically,
-        per config.py's `trades_stream`/`depth_stream` -- this must stay an
-        additive generalization, not a rename). Every other kind gets its
-        own `{stream_prefix}:{kind}` stream, keyed by whatever string the
-        adapter's `stream_type()` returns -- the runner never needs to know
-        what "mark_price" or "liquidation" mean, it just needs a stable
-        per-kind stream name for the normalizer to subscribe to. A falsy or
-        "unknown" kind (couldn't be classified at all) falls back to a
-        shared `{stream_prefix}:other` stream instead of minting a stream
-        literally named "unknown" or "None"."""
+    def _stream_for(self, symbol: str, kind: str) -> str:
+        """Route a `stream_type()` classification, for a specific symbol, to
+        a Redis stream name. Same routing rules as before Phase A
+        (`depth_diff`/`trade` keep their existing dedicated stream suffixes
+        -- the normalizer already consumes those two specifically, per
+        `normalizer/config.py`'s `trades_stream`/`depth_stream` -- every
+        other kind gets its own `:{kind}` stream, and a falsy/"unknown" kind
+        falls back to a shared `:other` stream instead of minting a stream
+        literally named "unknown" or "None"), just now built from
+        `config.stream_prefix(symbol)` instead of a single precomputed
+        connection-scoped prefix -- one connection can carry many symbols,
+        so the stream name can only be resolved once the message's symbol is
+        known (see `_connect_and_stream`)."""
+        prefix = self._config.stream_prefix(symbol)
         if kind == "depth_diff":
-            return self._depth_stream
+            return f"{prefix}:depth"
         if kind == "trade":
-            return self._trades_stream
+            return f"{prefix}:trades"
         if not kind or kind == "unknown":
-            return self._other_stream
-        return f"{self._config.stream_prefix}:{kind}"
+            return f"{prefix}:other"
+        return f"{prefix}:{kind}"
 
-    async def _publish(self, kind: str, message: dict[str, Any], receive_ts: int) -> None:
+    async def _publish(self, symbol: str, kind: str, message: dict[str, Any], receive_ts: int) -> None:
         """Publish one raw WS message, tagged with its `stream_type()`
-        classification, to the stream `_stream_for_kind(kind)` routes it to.
-        Same envelope shape used everywhere else in this module -- dumb
-        collector principle, no parsing beyond the classification string
-        itself."""
+        classification and its resolved symbol, to the stream
+        `_stream_for(symbol, kind)` routes it to. Same envelope shape used
+        everywhere else in this module -- dumb collector principle, no
+        parsing beyond the classification string and the symbol lookup
+        already done by the caller."""
         payload = {
             "type": kind,
             "receive_ts": receive_ts,
             "exchange": self._adapter.exchange,
             "segment": self._adapter.segment,
-            "symbol": self._adapter.symbol,
+            "symbol": symbol,
             "raw": message,
         }
-        await self._sink.publish(self._stream_for_kind(kind), payload)
+        await self._sink.publish(self._stream_for(symbol, kind), payload)
