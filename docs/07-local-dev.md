@@ -7,7 +7,7 @@ exchanges/symbols/segments.
 
 ## Services
 
-10 services, defined in `/workspace/docker-compose.yml`:
+10 services, defined in `docker-compose.yml` (repo root):
 
 - `redis` — Redis Streams broker (`noeviction` maxmemory policy; this prototype has
   no cache layer yet, so the whole instance is broker-only).

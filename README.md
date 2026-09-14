@@ -6,8 +6,10 @@ in tardis.dev and in the market as a whole — not at replicating the product 1:
 ## Local prototype
 
 A deliberately cut-down local Docker Compose stack (Binance spot BTCUSDT only,
-trades + L2 order book, no API/MCP yet) is running in `src/`, `infra/`, and
-`docker-compose.yml`. See [docs/07-local-dev.md](./docs/07-local-dev.md) to run it.
+trades + L2 order book, plus a REST + MCP serving layer) is running in `src/`,
+`infra/`, and `docker-compose.yml`. See [docs/07-local-dev.md](./docs/07-local-dev.md)
+to run it, and [docs/08-prototype-roadmap.md](./docs/08-prototype-roadmap.md) for
+the gap vs. the full MVP scope.
 
 ## Docs
 
@@ -22,3 +24,10 @@ trades + L2 order book, no API/MCP yet) is running in `src/`, `infra/`, and
     - [Bybit](./docs/04-architecture/exchanges/bybit.md)
 - [Risks / Open Issues](./docs/05-risks.md)
 - [Next Steps](./docs/06-next-steps.md)
+- [Local Dev](./docs/07-local-dev.md) — running the prototype stack (Docker Compose, REST/MCP, logging & monitoring).
+- [Prototype → MVP Roadmap](./docs/08-prototype-roadmap.md) — gap vs. MVP scope, build phases, open decisions.
+- [ADR-001: Hardening — Tests, Load Testing, Authorization](./docs/09-hardening-tests-load-auth.md) — architecture weak points found, plus decisions for the three (index doc).
+  - [Test Plan](./docs/10-test-plan.md) — 140 enumerated test cases, directory layout, test-blockers.
+  - [Load Testing Plan](./docs/11-load-testing-plan.md) — computed time-to-data-loss numbers, k6 script, Redis-lag harness.
+  - [Authorization Spec](./docs/12-authorization-spec.md) — API-key design: storage, middleware code, revocation, rate limiting, rollout.
+- [ADR-002: Architecture Validation](./docs/13-architecture-validation.md) — are the documented architecture decisions sound? ReplacingMergeTree for incidents, a process-supervision doc/impl drift, and more.
