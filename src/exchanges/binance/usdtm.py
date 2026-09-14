@@ -104,6 +104,13 @@ class BinanceUsdtmPerpAdapter:
     def __init__(self, symbol: str) -> None:
         self.symbol = symbol.upper()
         self._stream_symbol = symbol.lower()
+        # Phase A (docs/08-prototype-roadmap.md) generalized the
+        # ExchangeAdapter protocol to a `symbols: tuple[str, ...]` attribute
+        # since Binance spot now multiplexes many symbols per process. This
+        # adapter stays single-symbol-per-process (not generalized this
+        # round -- flagged for whoever tackles multi-symbol USDT-M perp),
+        # so `symbols` is always this one symbol as a one-element tuple.
+        self.symbols = (self.symbol,)
 
     # -- WS -------------------------------------------------------------
 
@@ -156,6 +163,12 @@ class BinanceUsdtmPerpAdapter:
             return "liquidation"
         return "unknown"
 
+    def symbol_of(self, raw_message: dict[str, Any]) -> str:
+        """Single-symbol adapter (Phase A generalization not yet applied to
+        USDT-M perp) -- every message on either named connection belongs to
+        `self.symbol`, so this never needs to inspect `raw_message` at all."""
+        return self.symbol
+
     def depth_update_ids(self, raw_message: dict[str, Any]) -> tuple[int, int]:
         """Return (U, u) from a depth-diff combined-stream envelope. The
         `pu` field (needed for futures' pu-based continuity check, per
@@ -167,10 +180,16 @@ class BinanceUsdtmPerpAdapter:
 
     # -- REST -------------------------------------------------------------
 
-    async def fetch_snapshot(self) -> dict[str, Any]:
+    async def fetch_snapshot(self, symbol: str) -> dict[str, Any]:
         """`GET /fapi/v1/depth?symbol=...&limit=1000` -- raw JSON body
-        untouched (bids/asks/lastUpdateId), per binance.md step 2."""
-        params = {"symbol": self.symbol, "limit": DEPTH_SNAPSHOT_LIMIT}
+        untouched (bids/asks/lastUpdateId), per binance.md step 2.
+
+        Takes `symbol` per the Phase A ExchangeAdapter protocol change (see
+        collector/adapter.py); this adapter is still single-symbol-per-
+        process so `symbol` is always `self.symbol` in practice, but the
+        runner always passes it explicitly now -- no implicit `self.symbol`
+        reliance here anymore."""
+        params = {"symbol": symbol.upper(), "limit": DEPTH_SNAPSHOT_LIMIT}
         async with httpx.AsyncClient(base_url=REST_BASE_URL, timeout=10.0) as client:
             resp = await client.get("/fapi/v1/depth", params=params)
             resp.raise_for_status()
