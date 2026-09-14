@@ -1,5 +1,7 @@
-"""Entrypoint: wire config -> Redis client -> ClickHouse sink -> two stream
-consumer tasks (trades, depth) + the periodic book-snapshot task, run forever.
+"""Entrypoint: wire config -> Redis client -> ClickHouse sink -> stream
+consumer tasks (trades, depth, and, from Phase B (docs/08-prototype-
+roadmap.md), mark_price/liquidation/poll) + the periodic book-snapshot
+task, run forever.
 """
 
 from __future__ import annotations
@@ -30,6 +32,10 @@ async def _main() -> None:
             "clickhouse_port": config.clickhouse_port,
             "trades_stream": config.trades_stream,
             "depth_stream": config.depth_stream,
+            "mark_price_stream": config.mark_price_stream,
+            "liquidation_stream": config.liquidation_stream,
+            "poll_stream": config.poll_stream,
+            "continuity_mode": config.continuity_mode,
             "consumer_group": config.consumer_group,
         },
     )
@@ -53,6 +59,7 @@ async def _main() -> None:
         segment=config.segment,
         symbol=config.symbol,
         sink=sink,
+        continuity=config.continuity_mode,
     )
 
     trades_consumer = StreamConsumer(
@@ -73,10 +80,45 @@ async def _main() -> None:
         count=config.read_count,
         handler=ctx.handle_depth,
     )
+    # Phase B (docs/08-prototype-roadmap.md): USDT-M perp streams. These are
+    # additive -- a spot-only deployment's collector never publishes to
+    # them, so these consumers just sit blocked on an empty/nonexistent
+    # stream (XREADGROUP with mkstream=True creates it if needed) rather
+    # than erroring.
+    mark_price_consumer = StreamConsumer(
+        redis_client=redis_client,
+        stream=config.mark_price_stream,
+        group=config.consumer_group,
+        consumer_name=f"{config.consumer_name}-mark-price",
+        block_ms=config.read_block_ms,
+        count=config.read_count,
+        handler=ctx.handle_mark_price,
+    )
+    liquidation_consumer = StreamConsumer(
+        redis_client=redis_client,
+        stream=config.liquidation_stream,
+        group=config.consumer_group,
+        consumer_name=f"{config.consumer_name}-liquidation",
+        block_ms=config.read_block_ms,
+        count=config.read_count,
+        handler=ctx.handle_liquidation,
+    )
+    poll_consumer = StreamConsumer(
+        redis_client=redis_client,
+        stream=config.poll_stream,
+        group=config.consumer_group,
+        consumer_name=f"{config.consumer_name}-poll",
+        block_ms=config.read_block_ms,
+        count=config.read_count,
+        handler=ctx.handle_poll,
+    )
 
     tasks = [
         asyncio.create_task(trades_consumer.run()),
         asyncio.create_task(depth_consumer.run()),
+        asyncio.create_task(mark_price_consumer.run()),
+        asyncio.create_task(liquidation_consumer.run()),
+        asyncio.create_task(poll_consumer.run()),
         asyncio.create_task(ctx.periodic_book_snapshot_loop(config.book_snapshot_interval_s)),
     ]
 

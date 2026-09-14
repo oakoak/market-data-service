@@ -1,8 +1,6 @@
 """MCP tool registrations. Tool names match docs/03-mvp-scope.md exactly:
-`get_trades`, `get_orderbook_at`, `get_orderbook_events`, `list_data_incidents`.
-`get_derivatives_metrics` is deliberately not implemented -- this prototype is
-spot-only with no funding/OI/liquidations data to back it (see the plan's
-Context section / normalizer/incidents.py precedent for the same scope cut).
+`get_trades`, `get_orderbook_at`, `get_orderbook_events`, `get_derivatives_metrics`,
+`list_data_incidents` -- all five MVP tools.
 
 Each tool is a thin wrapper around queries.py -- exactly the same functions
 rest.py's handlers call, so REST and MCP can never drift apart on query
@@ -99,6 +97,31 @@ def build_mcp_server(ch_client: ClickHouseReadClient, config: Config) -> FastMCP
             ts_to=queries.parse_ts(ts_to),
             limit=limit,
             cursor=cursor,
+        )
+        return queries.to_jsonable(result)
+
+    @mcp.tool()
+    async def get_derivatives_metrics(
+        symbol: str,
+        ts_from: str | None = None,
+        ts_to: str | None = None,
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch derivatives metrics for `symbol` in an optional [ts_from, ts_to]
+        ISO-8601 UTC time range: funding rate + mark/index price, open interest,
+        and liquidations, combined (docs/03-mvp-scope.md: "funding + OI +
+        liquidations together"). The `liquidations` list reflects Binance's
+        `forceOrder` stream, which is a partial tape (only the largest
+        liquidation per symbol per 1000ms window) -- see `GET /known-limitations`
+        / `liquidation_partial_coverage` for the full caveat."""
+        result = await queries.get_derivatives_metrics(
+            ch_client.client,
+            exchange=exchange or config.default_exchange,
+            segment=segment or config.default_segment,
+            symbol=symbol.upper(),
+            ts_from=queries.parse_ts(ts_from),
+            ts_to=queries.parse_ts(ts_to),
         )
         return queries.to_jsonable(result)
 

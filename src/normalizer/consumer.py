@@ -1,27 +1,25 @@
 """Redis Streams consumer-group logic for the normalizer.
 
-Stream-consumption split: **two independent consumer tasks in one process**,
-one per Redis Stream (`raw:{exchange}:{symbol}:trades` and `...:depth`),
-each running its own XREADGROUP loop against its own consumer group, rather
-than a single XREAD across both streams. Rationale:
-  - The two streams carry semantically unrelated payloads that feed
-    different downstream state (trades -> ClickHouse only; depth ->
-    ClickHouse *and* in-memory order-book state + sequence-break/incident
-    detection + disconnect/reconnect signal handling). Keeping them on
-    separate asyncio tasks means a slow/bursty depth stream (order book
-    diffs arrive far more often than trades) can't starve trade processing
-    behind a single blocking XREADGROUP call, and vice versa.
-  - `redis.asyncio`'s consumer-group API (XREADGROUP/XACK) operates per
-    stream key with its own group, so reading multiple streams in one call
-    (XREADGROUP ... STREAMS trades depth) is supported, but you then still
-    have to demux entries by which stream they came from before XACK'ing
-    against the right stream name -- two independent loops are simpler and
-    match "one task per concern" without any real downside at this message
-    rate (single-symbol prototype).
-  - Both tasks share one ClickHouseSink instance (batched, thread/task-safe
-    via per-table asyncio.Lock) and one OrderBookState + incident-tracking
-    context so depth-stream-detected incidents and trades share the same
-    flush cadence.
+Stream-consumption split: **one independent consumer task per Redis
+Stream** (`raw:{exchange}:{segment}:{symbol}:trades`, `...:depth`, and, from Phase B
+(docs/08-prototype-roadmap.md) onward, `...:mark_price`, `...:liquidation`,
+`...:poll`), each running its own XREADGROUP loop against its own consumer
+group, rather than a single XREAD across all of them. Rationale (unchanged
+from the spot-only prototype, now applies to five streams instead of two):
+  - Streams carry semantically unrelated payloads that feed different
+    downstream state (trades/mark_price/liquidations/poll -> ClickHouse
+    only; depth -> ClickHouse *and* in-memory order-book state +
+    sequence-break/incident detection + disconnect/reconnect signal
+    handling). Keeping them on separate asyncio tasks means a slow/bursty
+    stream can't starve another behind a single blocking XREADGROUP call.
+  - `redis.asyncio`'s consumer-group API operates per stream key with its
+    own group; reading multiple streams in one XREADGROUP call is
+    supported but then requires demuxing by stream name before XACK --
+    independent loops are simpler and match "one task per concern".
+  - All tasks share one ClickHouseSink instance (batched, thread/task-safe
+    via per-table asyncio.Lock) and one NormalizerContext (order book +
+    incident-tracking state) so every stream's detected incidents and rows
+    share the same flush cadence.
 
 Consumer-group recovery: a `create group if not exists` call with
 `mkstream=True` and `id="0"` covers first-run bootstrap; XACK is only sent
@@ -42,13 +40,25 @@ ack-batch-on-flush scheme; given this is a single-instrument local
 prototype (task scope explicitly says "keep it simple"), the small
 at-most-once loss window on crash is accepted and called out here rather
 than silently glossed over.
+
+**Phase B fix (multi-connection disconnect tracking):** the spot-only
+prototype tracked exactly one open `collector_disconnect` incident at a
+time (`self._open_disconnect`, a scalar). Per memory/collector.md /
+memory/exchanges.md, the collector's runner now supports multiple
+independently-managed named WS connections per adapter (e.g. USDT-M perp's
+`public`/`market` split), each emitting its own disconnect/reconnect signal
+tagged with `raw.connection` -- two connections can be down at once, or one
+can drop while the other is fine. `NormalizerContext` now keys open
+disconnect incidents by connection name (`self._open_disconnects: dict[str,
+dict]`) instead of a single scalar, so `public` and `market` disconnecting
+independently no longer clobber each other's incident bookkeeping.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, Literal
 
 import redis.asyncio as redis
 
@@ -58,6 +68,12 @@ from normalizer.clickhouse_sink import ClickHouseSink
 from normalizer.orderbook_state import OrderBookState
 
 log = get_logger("normalizer.consumer")
+
+# Default connection name for adapters that don't tag their signals with a
+# named connection (shouldn't happen post the collector's multi-connection
+# generalization, but guards against an older/malformed signal payload
+# rather than crashing on a missing key).
+_UNKNOWN_CONNECTION = "unknown"
 
 
 class StreamConsumer:
@@ -132,22 +148,54 @@ class StreamConsumer:
 
 
 class NormalizerContext:
-    """Shared state/handlers wired to both stream consumers: order-book
-    tracking, incident open/resolve bookkeeping, and the ClickHouse sink."""
+    """Shared state/handlers wired to all stream consumers: order-book
+    tracking, incident open/resolve bookkeeping, and the ClickHouse sink.
 
-    def __init__(self, *, exchange: str, segment: str, symbol: str, sink: ClickHouseSink) -> None:
+    `continuity`: which depth-diff sequencing rule OrderBookState enforces
+    for this deployment -- "spot" (U==prev.u+1) or "futures" (pu==prev.u,
+    binance.md step 5). Threaded from config (see main.py): a normalizer
+    process is scoped to one (exchange, segment, symbol), so this is a
+    single fixed choice for the process's lifetime, not a per-message
+    branch -- keeps OrderBookState itself free of Binance-specific segment
+    string matching (see orderbook_state.py module docstring).
+    """
+
+    def __init__(
+        self,
+        *,
+        exchange: str,
+        segment: str,
+        symbol: str,
+        sink: ClickHouseSink,
+        continuity: Literal["spot", "futures"] = "spot",
+        freeze_unchanged_threshold: int = incidents.FREEZE_UNCHANGED_THRESHOLD_DEFAULT,
+    ) -> None:
         self._exchange = exchange
         self._segment = segment
         self._symbol = symbol
         self._sink = sink
-        self._book = OrderBookState(exchange=exchange, segment=segment, symbol=symbol)
+        self._book = OrderBookState(exchange=exchange, segment=segment, symbol=symbol, continuity=continuity)
+        self._freeze_unchanged_threshold = freeze_unchanged_threshold
 
         # Open incidents kept in memory until resolved (single-process
         # prototype scope -- a restart loses track of a still-open
         # incident's in-memory handle, but the ClickHouse row remains with
         # status='open' for manual/API follow-up).
         self._open_sequence_break: dict[str, Any] | None = None
-        self._open_disconnect: dict[str, Any] | None = None
+        # Keyed by named WS connection (e.g. "combined" for spot,
+        # "public"/"market" for USDT-M perp) -- see module docstring
+        # "Phase B fix" above. Two connections disconnecting independently
+        # each get their own tracked incident.
+        self._open_disconnects: dict[str, dict[str, Any]] = {}
+
+        # reference_price_freeze detector state (XAUUSDT/XAGUSDT only, see
+        # incidents.py module docstring for the heuristic's caveats). This
+        # normalizer instance is scoped to a single symbol, so a single
+        # scalar pair of (last_value, unchanged_count) is sufficient -- no
+        # per-symbol dict needed.
+        self._mark_price_last_value: float | None = None
+        self._mark_price_unchanged_count: int = 0
+        self._open_price_freeze: dict[str, Any] | None = None
 
     async def handle_trade(self, envelope: dict[str, Any]) -> None:
         if envelope.get("type") != "trade":
@@ -169,6 +217,38 @@ class NormalizerContext:
         else:
             log.debug("unclassified depth-stream message", extra={"type": kind})
 
+    async def handle_mark_price(self, envelope: dict[str, Any]) -> None:
+        if envelope.get("type") != "mark_price":
+            log.debug("unexpected type on mark_price stream", extra={"type": envelope.get("type")})
+            return
+        row = parser.parse_mark_price(envelope)
+        await self._sink.add_mark_price(row)
+        await self._check_reference_price_freeze(row)
+
+    async def handle_liquidation(self, envelope: dict[str, Any]) -> None:
+        if envelope.get("type") != "liquidation":
+            log.debug("unexpected type on liquidation stream", extra={"type": envelope.get("type")})
+            return
+        row = parser.parse_liquidation(envelope)
+        await self._sink.add_liquidation(row)
+
+    async def handle_poll(self, envelope: dict[str, Any]) -> None:
+        """Handler for the `{stream_prefix}:poll` stream (collector's
+        rest_pollers() results, tagged with `type` = poller name --
+        src/collector/runner.py `_run_rest_poller`). Only "open_interest" is
+        implemented today (the only declared poller, per
+        src/exchanges/binance/usdtm.py); an unrecognized poller name is
+        logged and skipped rather than crashing, so a future poller can be
+        added collector-side without this handler needing to reject it
+        first.
+        """
+        kind = envelope.get("type")
+        if kind == "open_interest":
+            row = parser.parse_open_interest(envelope)
+            await self._sink.add_open_interest(row)
+        else:
+            log.debug("unrecognized poll stream type", extra={"type": kind})
+
     async def _handle_depth_diff(self, envelope: dict[str, Any]) -> None:
         row = parser.parse_depth_diff(envelope)
         # Persist the raw diff regardless of book-state continuity -- raw
@@ -183,15 +263,19 @@ class NormalizerContext:
                 segment=self._segment,
                 symbol=self._symbol,
                 last_valid_update_id=brk.last_valid_update_id,
+                continuity_mode=brk.continuity_mode,
+                received_prev_update_id=brk.received_prev_update_id,
             )
             self._open_sequence_break = incident
             await self._sink.add_incident(incident)
             log.warning(
                 "orderbook_sequence_break detected",
                 extra={
+                    "continuity_mode": brk.continuity_mode,
                     "last_valid_update_id": brk.last_valid_update_id,
                     "received_U": brk.received_update_id_U,
                     "received_u": brk.received_update_id_u,
+                    "received_pu": brk.received_prev_update_id,
                 },
             )
 
@@ -210,30 +294,83 @@ class NormalizerContext:
             log.info("orderbook_sequence_break resolved via new snapshot", extra={"last_update_id": row["last_update_id"]})
 
     async def _handle_disconnect(self, envelope: dict[str, Any]) -> None:
-        error = envelope.get("raw", {}).get("error")
+        raw = envelope.get("raw", {})
+        connection = raw.get("connection", _UNKNOWN_CONNECTION)
+        error = raw.get("error")
+        if connection in self._open_disconnects:
+            # Shouldn't normally happen (the collector only emits one
+            # `disconnect` per drop), but guard against a duplicate signal
+            # clobbering the original incident's start_ts.
+            log.debug("disconnect signal for already-open incident, ignoring", extra={"connection": connection})
+            return
         incident = incidents.open_disconnect_incident(
             exchange=self._exchange,
             segment=self._segment,
             symbol=self._symbol,
+            connection=connection,
             error=error,
         )
-        self._open_disconnect = incident
+        self._open_disconnects[connection] = incident
         await self._sink.add_incident(incident)
-        log.warning("collector_disconnect detected", extra={"error": error})
+        log.warning("collector_disconnect detected", extra={"connection": connection, "error": error})
 
     async def _handle_reconnect(self, envelope: dict[str, Any]) -> None:
-        if self._open_disconnect is None:
-            # Reconnect signal with no matching open disconnect (e.g.
-            # normalizer restarted mid-incident) -- nothing to resolve.
-            log.debug("reconnect signal with no tracked open disconnect incident")
+        raw = envelope.get("raw", {})
+        connection = raw.get("connection", _UNKNOWN_CONNECTION)
+        open_incident = self._open_disconnects.get(connection)
+        if open_incident is None:
+            # Reconnect signal with no matching open disconnect on this
+            # connection (e.g. normalizer restarted mid-incident) --
+            # nothing to resolve.
+            log.debug("reconnect signal with no tracked open disconnect incident", extra={"connection": connection})
             return
         resolved = incidents.resolve_disconnect_incident(
-            self._open_disconnect,
+            open_incident,
             reconnect_attempts=1,  # see incidents.py docstring: collector emits exactly one signal per attempt
         )
         await self._sink.add_incident(resolved)
-        self._open_disconnect = None
-        log.info("collector_disconnect resolved", extra={"downtime_ms": resolved["details"]["downtime_ms"]})
+        del self._open_disconnects[connection]
+        log.info(
+            "collector_disconnect resolved",
+            extra={"connection": connection, "downtime_ms": resolved["details"]["downtime_ms"]},
+        )
+
+    async def _check_reference_price_freeze(self, row: dict[str, Any]) -> None:
+        """Best-effort `reference_price_freeze` detection -- see
+        incidents.py module docstring for the heuristic's caveats. Only
+        runs for XAUUSDT/XAGUSDT (binance.md's documented freeze
+        candidates); every other symbol's markPrice is expected to move
+        continuously and is never evaluated against this heuristic at all.
+        """
+        if self._symbol not in incidents.FREEZE_CANDIDATE_SYMBOLS:
+            return
+
+        price = row["mark_price"]
+        if price == self._mark_price_last_value:
+            self._mark_price_unchanged_count += 1
+        else:
+            if self._open_price_freeze is not None:
+                resolved = incidents.resolve_reference_price_freeze_incident(self._open_price_freeze)
+                await self._sink.add_incident(resolved)
+                self._open_price_freeze = None
+                log.info("reference_price_freeze resolved, markPrice changed", extra={"symbol": self._symbol})
+            self._mark_price_last_value = price
+            self._mark_price_unchanged_count = 1
+
+        if self._mark_price_unchanged_count >= self._freeze_unchanged_threshold and self._open_price_freeze is None:
+            incident = incidents.open_reference_price_freeze_incident(
+                exchange=self._exchange,
+                segment=self._segment,
+                symbol=self._symbol,
+                frozen_price=price,
+                unchanged_count=self._mark_price_unchanged_count,
+            )
+            self._open_price_freeze = incident
+            await self._sink.add_incident(incident)
+            log.info(
+                "reference_price_freeze detected",
+                extra={"symbol": self._symbol, "unchanged_count": self._mark_price_unchanged_count},
+            )
 
     async def periodic_book_snapshot_loop(self, interval_s: float) -> None:
         """Every `interval_s`, if the book is ready, materialize its current

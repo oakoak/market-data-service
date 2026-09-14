@@ -11,6 +11,7 @@
 - Not "one heavy-image container per exchange" — Docker image size barely affects RAM (layers are shared). The real RAM drivers are: number of WS connections and their buffers, in-memory order-book state, runtime overhead.
 - One async process per exchange (Node/Python asyncio/Go/Rust tokio) holds hundreds-to-thousands of WS connections in a single process.
 - Stateless/stateful split: the collector (dumb, writes raw bytes + receive_ts to the queue) is stateless and easily scales horizontally; order-book state (needed only for point-in-time snapshots) is moved out to a separate service.
+- **Collector generic contract (2026-09):** one adapter instance (one exchange/segment/symbol) can open several independently-managed named WS connections concurrently -- not just one -- since some exchanges split their WS surface (e.g. Binance USDT-M perp's `/public`+`/market` split, see [Binance map](./exchanges/binance.md)); it can also declare periodic REST-only pollers for data with no WS stream at all (e.g. Open Interest). Both stay dumb-collector plumbing (`src/collector/adapter.py`, `src/collector/runner.py`) -- no parsing, just transport.
 - A message broker (Kafka/NATS/Redis Streams) between collection and processing decouples the "received" lifecycle from "processed/stored".
 - The collector is isolated behind a simple contract (raw bytes + timestamp at queue entry) — rewriting exactly this layer in Rust in the future becomes a local change.
 
@@ -72,7 +73,7 @@ Solution:
 - `GET /incidents?symbol=&from=&to=` — dynamic types only from the table above, time-ranged, answers "what happened in this range".
 - `GET /known-limitations` — a static, rarely-changing list of structural source limitations (`liquidation_partial_coverage` and future similar ones), with no `end_ts`. At MVP scale this doesn't need a separate table/daemon — a static config/JSON is sufficient (§6.7 principle — don't drag in more than needed).
 
-`reference_price_freeze` is deliberately kept dynamic rather than static: unlike `forceOrder`, each freeze is detectable as a concrete range for a concrete symbol — just with `severity: info`.
+`reference_price_freeze` is deliberately kept dynamic rather than static: unlike `forceOrder`, each freeze is detectable as a concrete range for a concrete symbol — just with `severity: info`. **Implementation note (2026-09, src/normalizer/incidents.py):** the MVP detector is a best-effort heuristic ("N consecutive unchanged `markPrice` values for XAUUSDT/XAGUSDT") with no real trading-hours/holiday calendar behind it — see docs/06-next-steps.md's equivalent open item for Bybit. `severity: info` is exactly what makes an eventual false positive from this heuristic (e.g. a genuinely flat price during open hours) low-cost rather than misleading.
 
 **Example — order book sequence break, Binance:**
 

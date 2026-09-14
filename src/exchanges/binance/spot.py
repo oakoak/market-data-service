@@ -35,7 +35,10 @@ DEPTH_SNAPSHOT_LIMIT = 1000
 class BinanceSpotAdapter:
     """Binance spot adapter for a single symbol, combined trade + depth-diff
     streams over one WS connection (binance.md: "one combined connection per
-    (exchange, segment) pair" -- segment here is 'spot')."""
+    (exchange, segment) pair" -- segment here is 'spot'). Satisfies
+    collector.adapter.ExchangeAdapter's multi-connection contract with a
+    single-entry `ws_urls()` dict and an empty `rest_pollers()` -- spot has
+    no split WS scheme and no REST-only data, unlike USDT-M perp."""
 
     exchange = "binance"
     segment = "spot"
@@ -48,8 +51,12 @@ class BinanceSpotAdapter:
 
     # -- WS -----------------------------------------------------------------
 
-    def ws_url(self) -> str:
-        """Combined-stream URL carrying both the trade and depth-diff streams.
+    def ws_urls(self) -> dict[str, str]:
+        """Single named connection ("combined") carrying both the trade and
+        depth-diff streams -- spot never split its WS scheme the way USDT-M
+        perp did (binance.md: "Spot also remains on the old unified
+        scheme"), so it stays a one-entry dict per the
+        ExchangeAdapter.ws_urls() contract (collector/adapter.py).
 
         Combined-stream envelope shape: {"stream": "<name>", "data": {...}}.
         """
@@ -57,7 +64,13 @@ class BinanceSpotAdapter:
             f"{self._stream_symbol}@trade",
             f"{self._stream_symbol}@depth@100ms",
         ]
-        return f"{WS_BASE_URL}/stream?streams={'/'.join(streams)}"
+        url = f"{WS_BASE_URL}/stream?streams={'/'.join(streams)}"
+        return {"combined": url}
+
+    def rest_pollers(self) -> dict[str, tuple]:
+        """Spot has no REST-only data (no Open Interest, no funding) --
+        nothing to poll."""
+        return {}
 
     def stream_type(self, raw_message: dict[str, Any]) -> str:
         """Classify a combined-stream envelope by its `stream` field."""

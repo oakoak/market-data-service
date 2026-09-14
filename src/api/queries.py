@@ -271,6 +271,70 @@ async def list_incidents(
     return rows
 
 
+async def get_derivatives_metrics(
+    client: AsyncClient,
+    *,
+    exchange: str,
+    segment: str,
+    symbol: str,
+    ts_from: datetime | None,
+    ts_to: datetime | None,
+) -> dict[str, Any]:
+    """Combine funding/mark/index price, open interest, and liquidations for
+    `symbol` over an optional [ts_from, ts_to] range (docs/03-mvp-scope.md:
+    "funding + OI + liquidations together"). Each of the three source tables
+    is queried independently and combined client-side -- no SQL join -- since
+    they're genuinely independent cadences (see 005_derivatives.sql's header:
+    markPrice ~1s, open interest ~45s REST poll, liquidations irregular
+    forceOrder events). Callers should also surface the
+    `liquidation_partial_coverage` entry from `get_known_limitations()`
+    alongside this response's `liquidations` list -- forceOrder is not a
+    complete tape (see known_limitations.py)."""
+    conditions = ["exchange = {exchange:String}", "segment = {segment:String}", "symbol = {symbol:String}"]
+    params: dict[str, Any] = {"exchange": exchange, "segment": segment, "symbol": symbol}
+    if ts_from is not None:
+        conditions.append("ts_exchange >= {ts_from:DateTime64(3)}")
+        params["ts_from"] = ts_from
+    if ts_to is not None:
+        conditions.append("ts_exchange <= {ts_to:DateTime64(3)}")
+        params["ts_to"] = ts_to
+    where = " AND ".join(conditions)
+
+    mark_price_query = f"""
+        SELECT exchange, segment, symbol, mark_price, index_price, funding_rate,
+               next_funding_time, ts_exchange, ts_received
+        FROM mark_price
+        WHERE {where}
+        ORDER BY ts_exchange ASC
+    """
+    open_interest_query = f"""
+        SELECT exchange, segment, symbol, open_interest, ts_exchange, ts_received
+        FROM open_interest
+        WHERE {where}
+        ORDER BY ts_exchange ASC
+    """
+    liquidations_query = f"""
+        SELECT exchange, segment, symbol, side, price, avg_price, quantity,
+               filled_quantity, order_status, ts_exchange, ts_received
+        FROM liquidations
+        WHERE {where}
+        ORDER BY ts_exchange ASC
+    """
+
+    mark_price_result = await client.query(mark_price_query, parameters=params)
+    open_interest_result = await client.query(open_interest_query, parameters=params)
+    liquidations_result = await client.query(liquidations_query, parameters=params)
+
+    return {
+        "exchange": exchange,
+        "segment": segment,
+        "symbol": symbol,
+        "mark_price": _rows(mark_price_result),
+        "open_interest": _rows(open_interest_result),
+        "liquidations": _rows(liquidations_result),
+    }
+
+
 def get_known_limitations() -> list[dict[str, Any]]:
     from api.known_limitations import KNOWN_LIMITATIONS
 

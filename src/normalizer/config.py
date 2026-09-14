@@ -44,7 +44,15 @@ class Config:
 
     @property
     def stream_prefix(self) -> str:
-        return f"raw:{self.exchange}:{self.symbol.lower()}"
+        # Must include segment -- multiple segments (spot, usdtm, coinm) for
+        # the same exchange/symbol run as concurrent collector instances and
+        # would otherwise collide on identical Redis stream names (e.g.
+        # binance spot BTCUSDT and binance usdtm BTCUSDT trades/depth
+        # interleaving on the same stream). Format mirrors
+        # collector/config.py's stream_prefix byte-for-byte -- both sides
+        # must agree, since the normalizer consumes exactly what the
+        # collector publishes (2026-09 fix, coordinator-flagged).
+        return f"raw:{self.exchange}:{self.segment}:{self.symbol.lower()}"
 
     @property
     def trades_stream(self) -> str:
@@ -53,6 +61,34 @@ class Config:
     @property
     def depth_stream(self) -> str:
         return f"{self.stream_prefix}:depth"
+
+    # Phase B (docs/08-prototype-roadmap.md): USDT-M perp streams, matching
+    # src/collector/runner.py's `_stream_for_kind` routing exactly --
+    # mark_price/liquidation get their own `{stream_prefix}:{kind}` stream,
+    # poll results (Open Interest) share the generic `:poll` stream tagged
+    # by `type` (see NormalizerContext.handle_poll in consumer.py).
+    @property
+    def mark_price_stream(self) -> str:
+        return f"{self.stream_prefix}:mark_price"
+
+    @property
+    def liquidation_stream(self) -> str:
+        return f"{self.stream_prefix}:liquidation"
+
+    @property
+    def poll_stream(self) -> str:
+        return f"{self.stream_prefix}:poll"
+
+    # Which depth-diff continuity rule this deployment's OrderBookState
+    # should enforce (see orderbook_state.py module docstring). Binance
+    # spot has no `pu` field and uses U==prev.u+1; every non-spot segment
+    # (USDT-M perp today, COIN-M perp/futures later) uses Binance's
+    # futures pu==prev.u rule instead. This is a config-level inference
+    # from `segment`, not a per-message branch -- a normalizer process is
+    # scoped to one (exchange, segment, symbol) for its whole lifetime.
+    @property
+    def continuity_mode(self) -> str:
+        return "spot" if self.segment == "spot" else "futures"
 
 
 def load_config() -> Config:

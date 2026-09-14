@@ -93,9 +93,11 @@ curl "http://api.localhost/orderbook/events?symbol=BTCUSDT&limit=5&cursor=<next_
 # Data-quality incidents (collector disconnects, order-book sequence breaks)
 curl "http://api.localhost/incidents?symbol=BTCUSDT"
 
-# Static list of known data-collection gaps (empty in this prototype -- see
-# src/api/known_limitations.py; this prototype doesn't collect forceOrder/
-# liquidations data at all, so there's nothing to declare yet)
+# Funding rate + mark/index price, open interest, and liquidations, combined
+curl "http://api.localhost/derivatives?symbol=BTCUSDT&segment=usdtm"
+
+# Static list of known data-collection gaps (see src/api/known_limitations.py;
+# currently one entry -- Binance forceOrder's partial liquidation coverage)
 curl "http://api.localhost/known-limitations"
 ```
 
@@ -105,12 +107,11 @@ Interactive OpenAPI docs are also available at `http://api.localhost/docs`.
 
 The same process exposes an MCP server (streamable-http transport) mounted at
 `http://api.localhost/mcp`. Any MCP client configured with that URL can
-discover and call the 4 tools that match docs/03-mvp-scope.md's tool list:
-`get_trades`, `get_orderbook_at`, `get_orderbook_events`, `list_data_incidents`.
-(`get_derivatives_metrics` is intentionally not implemented — this prototype is
-spot-only with no funding/OI/liquidations data to back it.) Each tool is a thin
-wrapper over the same `src/api/queries.py` functions the REST routes call, so
-both protocols return identical data for the same query.
+discover and call all 5 tools that match docs/03-mvp-scope.md's tool list:
+`get_trades`, `get_orderbook_at`, `get_orderbook_events`, `get_derivatives_metrics`,
+`list_data_incidents`. Each tool is a thin wrapper over the same
+`src/api/queries.py` functions the REST routes call, so both protocols return
+identical data for the same query.
 
 ## Logging & monitoring
 

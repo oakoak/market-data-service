@@ -1,14 +1,33 @@
 """In-memory order-book state tracker for a single (exchange, segment, symbol).
 
-Responsibilities (task scope, Binance spot only):
+Responsibilities (Phase B, docs/08-prototype-roadmap.md: spot + USDT-M perp):
 - Apply the REST snapshot pushed by the collector as a `snapshot` message.
 - Apply depth-diff events on top of it, maintaining a full price->qty book.
 - Detect `orderbook_sequence_break` per docs/04-architecture/exchanges/
-  binance.md step 5 (spot continuity: current.U == previous.u + 1) and
-  docs/04-architecture/00-overview.md §6.3.1.
+  binance.md step 5 and docs/04-architecture/00-overview.md §6.3.1, using an
+  exchange/segment-aware continuity check (see `_check_continuity` below):
+  spot uses `current.U == previous.u + 1`; USDT-M/COIN-M futures use
+  `current.pu == previous.u` (the `pu` field -- absent on spot, always
+  present on futures diffs per binance.md).
 - Periodically hand back a full-book snapshot row for
   market_data.orderbook_snapshots (docs §6.4: every 1-5 min; interval is
   configurable, see config.book_snapshot_interval_s).
+
+Continuity strategy generalization (Phase B): the original prototype
+hardcoded the spot `U == previous.u + 1` rule directly in `apply_diff`.
+Binance futures uses a structurally different rule (`pu == previous.u`,
+via a field spot doesn't even have) per binance.md step 5. Rather than
+branching on `segment` string values inline (which would tie this class to
+Binance's specific segment names, e.g. 'usdtm' vs a hypothetical
+Bybit 'linear'), continuity is expressed as a small strategy selected once
+at construction time from a `continuity` parameter: `"spot"` picks the
+U==prev.u+1 rule, `"futures"` picks the pu==prev.u rule. The caller
+(consumer.py) decides which to pass based on whether `prev_update_id` is
+populated on the parsed rows for this deployment (i.e. whether the source
+segment is a Binance futures segment) -- this keeps OrderBookState itself
+free of Binance-specific segment-name string matching, and ready for a
+future Bybit `seq`-based continuity strategy to be added the same way
+without touching the two existing ones.
 
 Resync strategy on a detected break (see module docstring in incidents.py
 for the incident side): this prototype **waits for the collector's next
@@ -44,7 +63,9 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
+
+ContinuityMode = Literal["spot", "futures"]
 
 
 @dataclass
@@ -52,6 +73,11 @@ class SequenceBreak:
     last_valid_update_id: int
     received_update_id_u: int
     received_update_id_U: int
+    # Which field the continuity check used -- surfaced so the incident
+    # `details` payload can be accurate for both spot (`U`) and futures
+    # (`pu`) breaks instead of always describing a spot-shaped break.
+    continuity_mode: ContinuityMode = "spot"
+    received_prev_update_id: int | None = None
 
 
 @dataclass
@@ -59,6 +85,11 @@ class OrderBookState:
     exchange: str
     segment: str
     symbol: str
+
+    # Which continuity rule this instance enforces -- see module docstring.
+    # Defaults to "spot" (the original behavior) so existing spot callers
+    # need no change; USDT-M/COIN-M deployments pass continuity="futures".
+    continuity: ContinuityMode = "spot"
 
     _bids: dict[float, float] = field(default_factory=dict)
     _asks: dict[float, float] = field(default_factory=dict)
@@ -93,9 +124,9 @@ class OrderBookState:
         reconstruction pauses).
 
         Bootstrap handling (binance.md steps 3-5): right after a snapshot is
-        applied, the first event is not held to the strict `U == prev.u + 1`
-        continuity rule (that's a general-purpose comparison to a *previous
-        event*, and there is no previous event yet). Instead:
+        applied, the first event is not held to the strict continuity rule
+        (that's a general-purpose comparison to a *previous event*, and
+        there is no previous event yet). Instead:
           - events that predate the snapshot (`u <= lastUpdateId`) are stale
             and silently discarded (not a break, not applied);
           - the first non-stale event must straddle the snapshot
@@ -103,8 +134,11 @@ class OrderBookState:
           - anything else at this stage (e.g. a gap where even the first
             available event's `U` is already past `lastUpdateId+1`) is a
             genuine sequence break.
+        This bootstrap straddle check is identical for spot and futures
+        (binance.md steps 1-4 don't differentiate) -- only step 5's ongoing
+        continuity rule differs, see `_check_continuity`.
         Once the anchor has been accepted, `_bootstrapped` is True and every
-        subsequent event goes through the strict `U == prev.u + 1` check.
+        subsequent event goes through `_check_continuity`.
         """
         if not self.ready or self.awaiting_resync:
             return None
@@ -121,7 +155,7 @@ class OrderBookState:
 
             # binance.md step 4: the first applied event must straddle the
             # snapshot's lastUpdateId -- checked once, as a range, not with
-            # equality.
+            # equality. Identical for spot and futures.
             if first_update_id <= self.last_update_id + 1 <= final_update_id:
                 self._apply_levels(self._bids, row["bids"])
                 self._apply_levels(self._asks, row["asks"])
@@ -131,21 +165,17 @@ class OrderBookState:
 
             # Neither stale nor a valid straddle -- there's a gap between
             # the snapshot and the earliest available diff event.
-            brk = SequenceBreak(
-                last_valid_update_id=self.last_update_id,
-                received_update_id_u=final_update_id,
-                received_update_id_U=first_update_id,
-            )
             self.awaiting_resync = True
-            return brk
-
-        # binance.md step 5, spot: current.U == previous.u + 1
-        if first_update_id != self.last_update_id + 1:
-            brk = SequenceBreak(
+            return SequenceBreak(
                 last_valid_update_id=self.last_update_id,
                 received_update_id_u=final_update_id,
                 received_update_id_U=first_update_id,
+                continuity_mode=self.continuity,
+                received_prev_update_id=row.get("prev_update_id"),
             )
+
+        brk = self._check_continuity(row)
+        if brk is not None:
             self.awaiting_resync = True
             return brk
 
@@ -153,6 +183,40 @@ class OrderBookState:
         self._apply_levels(self._asks, row["asks"])
         self.last_update_id = final_update_id
         return None
+
+    def _check_continuity(self, row: dict[str, Any]) -> SequenceBreak | None:
+        """binance.md step 5, exchange/segment-aware:
+          - spot:    current.U  == previous.u + 1
+          - futures: current.pu == previous.u   (`pu` = Binance's
+                     "previous update id" field; absent on spot, always
+                     present on USDT-M/COIN-M diffs)
+        Returns a SequenceBreak (not yet marked awaiting_resync -- the
+        caller does that) on a violation, None if continuity holds.
+        """
+        assert self.last_update_id is not None
+        first_update_id = row["first_update_id"]
+        final_update_id = row["final_update_id"]
+
+        if self.continuity == "futures":
+            prev_update_id = row.get("prev_update_id")
+            # A futures diff with no `pu` at all would itself be a data
+            # anomaly (the field is mandatory on futures per binance.md) --
+            # treat it as a break rather than silently falling back to the
+            # spot rule, so a malformed/mis-routed message surfaces loudly
+            # instead of corrupting book state.
+            broke = prev_update_id is None or prev_update_id != self.last_update_id
+        else:
+            broke = first_update_id != self.last_update_id + 1
+
+        if not broke:
+            return None
+        return SequenceBreak(
+            last_valid_update_id=self.last_update_id,
+            received_update_id_u=final_update_id,
+            received_update_id_U=first_update_id,
+            continuity_mode=self.continuity,
+            received_prev_update_id=row.get("prev_update_id"),
+        )
 
     @staticmethod
     def _apply_levels(book_side: dict[float, float], levels: list[tuple[float, float]]) -> None:
@@ -164,7 +228,7 @@ class OrderBookState:
 
     def to_snapshot_row(self, ts_ms: int | None = None) -> dict[str, Any]:
         """Materialize current book state as a market_data.orderbook_snapshots
-        row (periodic full-book snapshot, docs §6.4)."""
+        row (docs §6.4 periodic snapshot)."""
         from datetime import datetime, timezone
 
         ts_ms = ts_ms if ts_ms is not None else int(time.time() * 1000)

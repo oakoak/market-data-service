@@ -183,6 +183,75 @@ async def incidents(
     )
 
 
+class MarkPriceOut(BaseModel):
+    exchange: str
+    segment: str
+    symbol: str
+    mark_price: float
+    index_price: float
+    funding_rate: float | None
+    next_funding_time: datetime | None
+    ts_exchange: datetime
+    ts_received: datetime
+
+
+class OpenInterestOut(BaseModel):
+    exchange: str
+    segment: str
+    symbol: str
+    open_interest: float
+    ts_exchange: datetime
+    ts_received: datetime
+
+
+class LiquidationOut(BaseModel):
+    exchange: str
+    segment: str
+    symbol: str
+    side: str
+    price: float
+    avg_price: float
+    quantity: float
+    filled_quantity: float
+    order_status: str
+    ts_exchange: datetime
+    ts_received: datetime
+
+
+class DerivativesMetricsResponse(BaseModel):
+    exchange: str
+    segment: str
+    symbol: str
+    mark_price: list[MarkPriceOut]
+    open_interest: list[OpenInterestOut]
+    liquidations: list[LiquidationOut]
+
+
+@router.get("/derivatives", response_model=DerivativesMetricsResponse)
+async def derivatives(
+    request: Request,
+    symbol: str,
+    ts_from: str | None = Query(default=None),
+    ts_to: str | None = Query(default=None),
+    exchange: str | None = Query(default=None),
+    segment: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """Funding rate + mark/index price, open interest, and liquidations for
+    `symbol`, combined (docs/03-mvp-scope.md: "funding + OI + liquidations
+    together"). `liquidations` reflects Binance's `forceOrder` stream, a
+    partial tape -- see `GET /known-limitations` / `liquidation_partial_coverage`.
+    """
+    exchange, segment = _defaults(request, exchange, segment)
+    return await queries.get_derivatives_metrics(
+        request.app.state.ch_client.client,
+        exchange=exchange,
+        segment=segment,
+        symbol=symbol.upper(),
+        ts_from=_parse_ts(ts_from),
+        ts_to=_parse_ts(ts_to),
+    )
+
+
 @router.get("/known-limitations", response_model=list[dict[str, Any]])
 async def known_limitations() -> list[dict[str, Any]]:
     return queries.get_known_limitations()

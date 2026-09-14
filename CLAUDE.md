@@ -7,10 +7,16 @@ not a 1:1 clone. Full context: `docs/` (start with `docs/01-idea-and-market.md`,
 
 ## Current state
 
-Local prototype only: **Binance spot BTCUSDT**, trades + L2 order book, no auth,
-no cache layer. Gap vs. full MVP scope tracked in `docs/08-prototype-roadmap.md`.
-Don't assume multi-exchange, multi-instrument, or auth exist — check the roadmap
-doc before building on top of them.
+Local prototype only, single symbol per segment, no auth, no cache layer:
+**Binance spot BTCUSDT** (trades + L2 order book) and, since Phase B,
+**Binance USDT-M perp** (trades/aggTrade + L2 order book + funding/mark/index
+price + open interest + liquidations, one symbol at a time via `SEGMENT=usdtm`).
+COIN-M perp (Phase C) is not implemented. Multi-symbol collection (Phase A) is
+also still not implemented — one collector/normalizer process still handles
+exactly one (exchange, segment, symbol). Gap vs. full MVP scope tracked in
+`docs/08-prototype-roadmap.md`. Don't assume multi-exchange, multi-instrument,
+multi-segment-at-once, or auth exist — check the roadmap doc before building
+on top of them.
 
 ## Stack (see docs/04-architecture/01-stack.md for rationale)
 
@@ -130,3 +136,53 @@ Per-domain files match the agents above: `memory/collector.md`,
 `memory/general.md` for anything cross-cutting. Each agent should check its own
 memory file before starting work (fresher than docs for operational state) and
 add an entry when it learns something durable that docs don't already say.
+
+## Git workflow
+
+**Never commit directly to `main`.** Every feature/fix gets its own branch, a
+commit, and a push — even small changes. `main` only receives merges.
+
+**Branch naming**: `<type>/<short-topic>`, matching the agent/area it touches
+when there is one:
+
+```
+feat/bybit-usdtm-adapter     # exchange-adapter work
+fix/orderbook-snapshot-gap   # normalizer-agent work
+feat/derivatives-metrics     # cross-cutting (collector+normalizer+api)
+docs/competitor-analysis     # docs-only change
+```
+
+`type` is one of `feat`, `fix`, `docs`, `infra`, `chore` — matches the commit
+prefix below.
+
+**Commits**: `<type>: <what changed, imperative, present tense>` — one logical
+change per commit, not a end-of-session dump. Not `"fix docs"` / `"some fix"`
+(examples of what NOT to do, from this repo's own history) — say what actually
+changed: `fix: correct incident schema link in overview doc`.
+
+**Before pushing**: run `verify-gate` on the diff (see Agents — routing above).
+Don't push on a failed gate — fix first.
+
+**Push**: `git push -u origin <branch>` on first push of a branch, plain
+`git push` after. Open a PR into `main` rather than merging locally — this repo
+has `origin` configured (`github.com/oakoak/market-data-service`), use it.
+
+**Sequence for any feature/fix**:
+```bash
+git checkout main && git pull
+git checkout -b feat/<topic>
+# ... work, guided by the relevant agent(s) ...
+# verify-gate check
+git add <specific files>          # never `git add -A`/`.` blindly
+git commit -m "feat: <what changed>"
+git push -u origin feat/<topic>
+gh pr create --fill               # or open the PR on github.com
+```
+
+**Enforced automatically.** `.claude/hooks/git_workflow_gate.py` runs as a
+`Stop` hook (`.claude/settings.json`) — every time the agent tries to finish a
+turn, it checks: uncommitted changes on `main` (blocks — go make a branch),
+uncommitted changes on a feature branch (blocks — commit them), or committed
+but unpushed (blocks — push). The agent can't just say "done" and stop while
+any of those are true; it has to act on the hook's message first. This is a
+backstop, not a replacement for doing it right the first time.

@@ -24,6 +24,11 @@ def build_adapter(config: Config) -> ExchangeAdapter:
 
         return BinanceSpotAdapter(symbol=config.symbol)
 
+    if config.exchange == "binance" and config.segment == "usdtm":
+        from exchanges.binance import BinanceUsdtmPerpAdapter
+
+        return BinanceUsdtmPerpAdapter(symbol=config.symbol)
+
     raise NotImplementedError(
         f"No adapter registered for exchange={config.exchange!r} segment={config.segment!r}. "
         "Add one under src/exchanges/<exchange>/ and register it here."

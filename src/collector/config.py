@@ -26,7 +26,13 @@ class Config:
 
     @property
     def stream_prefix(self) -> str:
-        return f"raw:{self.exchange}:{self.symbol.lower()}"
+        # Must include segment -- multiple segments (spot, usdtm, coinm) for
+        # the same exchange/symbol run as concurrent collector instances and
+        # would otherwise collide on identical Redis stream names (e.g.
+        # binance spot BTCUSDT and binance usdtm BTCUSDT trades/depth
+        # interleaving on the same stream). Format mirrors
+        # normalizer/config.py's stream_prefix -- both sides must agree.
+        return f"raw:{self.exchange}:{self.segment}:{self.symbol.lower()}"
 
 
 def load_config() -> Config:

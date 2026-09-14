@@ -29,8 +29,8 @@ work starts.
 |---|---|---|---|
 | Instruments | 1 symbol (BTCUSDT spot) | 8 spot + 13 USDT-M perp + 2 COIN-M perp (~23 symbols), see [Binance map](./04-architecture/exchanges/binance.md) | Collector must run many symbols/streams per segment, not one |
 | Segments | Spot only | Spot + USDT-M perp + COIN-M perp | 2 new exchange adapters, 2 new WS connection schemes (`/public`+`/market` vs `dstream`) |
-| Derivatives data | None | Funding, mark/index price, OI, liquidations (perp only) | No adapter code, no OI REST poller, no ClickHouse table, no normalizer parsing |
-| `get_derivatives_metrics` | Not implemented (explicitly deferred, see `mcp_tools.py` docstring) | Required MVP tool | Blocked on the row above |
+| Derivatives data | **Implemented for USDT-M perp** (Phase B, see below): `BinanceUsdtmPerpAdapter` (aggTrade/depth/markPrice/forceOrder + OI REST poller), migration `005_derivatives.sql` (`mark_price`, `open_interest`, `liquidations` tables), normalizer parsing + `reference_price_freeze` incident detection (best-effort heuristic, not empirically validated -- see [Next Steps](./06-next-steps.md) item 1). COIN-M perp still has none of this (Phase C). | Funding, mark/index price, OI, liquidations (perp only) | COIN-M perp adapter/schema reuse (Phase C); multi-symbol collection (Phase A still not done -- one symbol per collector instance) |
+| `get_derivatives_metrics` | **Implemented**: `GET /derivatives` + MCP tool, querying `mark_price`/`open_interest`/`liquidations` independently and combining client-side, per `queries.py` | Required MVP tool | None -- closed for USDT-M perp; will need re-verification once COIN-M perp lands (Phase C) if that segment's schema needs match this one's |
 | Incidents coverage | `orderbook_sequence_break`, `collector_disconnect` | + `reference_price_freeze` (XAUUSDT/XAGUSDT), + `backfill_gap` | Needs markPrice stream + a freeze detector; needs a defined "confirmed unrecoverable gap" trigger |
 | `known-limitations` | Empty (nothing to declare yet) | `liquidation_partial_coverage` (forceOrder) populated | Trivial once liquidations are collected — static config entry |
 | Access | Local `docker compose up`, `*.localhost` via Traefik | Hosted REST/WS API reachable by 5-10 external users | Needs a real host, TLS, DNS, and some form of per-user access control (currently none). Concrete auth plan (API-key recommendation): [ADR-001](./09-hardening-tests-load-auth.md#3-authorization). |
@@ -51,7 +51,7 @@ path without yet touching a new WS protocol. Config-driven symbol list
 (`.env` `SYMBOLS=...` instead of singular `SYMBOL=`) is the natural extension
 of the current `EXCHANGE`/`SEGMENT`/`SYMBOL` pattern.
 
-**Phase B — USDT-M perp.** New adapter against the `/public`+`/market`+`/private`
+**Phase B — USDT-M perp. STATUS: implemented (see repo history / `memory/*.md` for the session trail).** New adapter against the `/public`+`/market`+`/private`
 scheme: trades, L2 order book (same bootstrap/reconciliation logic, `pu`-based
 continuity instead of spot's `U`/`u`), `markPrice@1s` WS, `forceOrder` WS,
 and the one REST poller in the whole pipeline (`openInterest`, since it has no

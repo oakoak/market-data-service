@@ -2,12 +2,14 @@
 client (docs/04-architecture/01-stack.md: >=0.12.0 has native async I/O on
 aiohttp, no `asyncio.to_thread` wrapping needed for batch inserts).
 
-Batching policy (kept simple per task instructions): each of the four
-tables (trades, orderbook_events, orderbook_snapshots, incidents) has its
-own buffer, flushed when it reaches `batch_size` rows or every
-`flush_interval_s` seconds, whichever comes first. A background flusher
-task drives the timer; callers (consumer.py) call `add_*` and the sink
-flushes synchronously inline once a buffer is full.
+Batching policy (kept simple per task instructions): each table (trades,
+orderbook_events, orderbook_snapshots, incidents, and, from Phase B
+(docs/08-prototype-roadmap.md), mark_price/open_interest/liquidations --
+see infra/clickhouse/migrations/005_derivatives.sql) has its own buffer,
+flushed when it reaches `batch_size` rows or every `flush_interval_s`
+seconds, whichever comes first. A background flusher task drives the
+timer; callers (consumer.py) call `add_*` and the sink flushes
+synchronously inline once a buffer is full.
 """
 
 from __future__ import annotations
@@ -76,6 +78,42 @@ INCIDENTS_COLUMNS = [
     "details",
 ]
 
+# infra/clickhouse/migrations/005_derivatives.sql
+MARK_PRICE_COLUMNS = [
+    "exchange",
+    "segment",
+    "symbol",
+    "mark_price",
+    "index_price",
+    "funding_rate",
+    "next_funding_time",
+    "ts_exchange",
+    "ts_received",
+]
+
+OPEN_INTEREST_COLUMNS = [
+    "exchange",
+    "segment",
+    "symbol",
+    "open_interest",
+    "ts_exchange",
+    "ts_received",
+]
+
+LIQUIDATIONS_COLUMNS = [
+    "exchange",
+    "segment",
+    "symbol",
+    "side",
+    "price",
+    "avg_price",
+    "quantity",
+    "filled_quantity",
+    "order_status",
+    "ts_exchange",
+    "ts_received",
+]
+
 
 class ClickHouseSink:
     def __init__(
@@ -103,6 +141,9 @@ class ClickHouseSink:
             "orderbook_events": [],
             "orderbook_snapshots": [],
             "incidents": [],
+            "mark_price": [],
+            "open_interest": [],
+            "liquidations": [],
         }
         self._locks: dict[str, asyncio.Lock] = {
             name: asyncio.Lock() for name in self._buffers
@@ -164,6 +205,15 @@ class ClickHouseSink:
             prepared["details"] = _json.dumps(details, default=str)
         await self._add("incidents", INCIDENTS_COLUMNS, prepared)
 
+    async def add_mark_price(self, row: dict[str, Any]) -> None:
+        await self._add("mark_price", MARK_PRICE_COLUMNS, row)
+
+    async def add_open_interest(self, row: dict[str, Any]) -> None:
+        await self._add("open_interest", OPEN_INTEREST_COLUMNS, row)
+
+    async def add_liquidation(self, row: dict[str, Any]) -> None:
+        await self._add("liquidations", LIQUIDATIONS_COLUMNS, row)
+
     async def _add(self, table: str, columns: list[str], row: dict[str, Any]) -> None:
         values = [row.get(col) for col in columns]
         async with self._locks[table]:
@@ -192,4 +242,7 @@ _COLUMNS_BY_TABLE = {
     "orderbook_events": ORDERBOOK_EVENTS_COLUMNS,
     "orderbook_snapshots": ORDERBOOK_SNAPSHOTS_COLUMNS,
     "incidents": INCIDENTS_COLUMNS,
+    "mark_price": MARK_PRICE_COLUMNS,
+    "open_interest": OPEN_INTEREST_COLUMNS,
+    "liquidations": LIQUIDATIONS_COLUMNS,
 }

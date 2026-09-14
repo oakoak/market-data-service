@@ -1,4 +1,4 @@
-"""Binance exchange adapter (spot only, for this prototype).
+"""Binance exchange adapters (spot + USDT-M perp, for this prototype).
 
 Exchange-specific concerns live here so they can be swapped out per
 docs/04-architecture/00-overview.md §6.2 (adapter/plugin pattern): WS URL
@@ -8,5 +8,6 @@ or REST endpoints.
 """
 
 from .spot import BinanceSpotAdapter
+from .usdtm import BinanceUsdtmPerpAdapter
 
-__all__ = ["BinanceSpotAdapter"]
+__all__ = ["BinanceSpotAdapter", "BinanceUsdtmPerpAdapter"]
