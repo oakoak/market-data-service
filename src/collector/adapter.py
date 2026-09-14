@@ -24,6 +24,19 @@ Some data (Binance Open Interest) has no WS stream at all and is REST-poll
 only. `rest_pollers()` lets an adapter declare periodic REST polls the
 runner should schedule and publish to Redis the same way it publishes WS
 messages -- see runner.py. Adapters with nothing to poll return `{}`.
+
+**Multi-symbol contract (2026-09 Phase A, docs/08-prototype-roadmap.md):** an
+adapter instance is no longer scoped to a single symbol -- `symbol: str` is
+replaced by `symbols: tuple[str, ...]`, and a named WS connection may carry
+messages for *any* symbol in that tuple, interleaved (binance.md: "one
+combined connection per (exchange, segment) pair" covers every symbol in the
+segment, not one connection per symbol). Two methods follow from that:
+`symbol_of()` lets the runner find out which symbol a given raw message
+belongs to (needed to route it to that symbol's own Redis stream, and to key
+the per-symbol buffer-until-snapshot-ready state -- see runner.py), and
+`fetch_snapshot()` now takes the symbol it's fetching a REST snapshot for,
+since the snapshot dance runs independently per symbol, not once per
+connection.
 """
 
 from __future__ import annotations
@@ -34,35 +47,41 @@ from typing import Any, Awaitable, Callable, Protocol
 class ExchangeAdapter(Protocol):
     """Everything the collector runner needs from a specific exchange/segment.
 
-    An adapter instance is scoped to one (exchange, segment, symbol). It may
-    open several concurrent WS connections (see `ws_urls()`) and/or declare
-    periodic REST pollers (see `rest_pollers()`) -- both stay dumb-collector
-    plumbing: URLs, opaque message classification, and raw REST bodies, never
-    parsing into the unified schema (that's normalizer's job).
+    An adapter instance is scoped to one (exchange, segment) and a *list* of
+    symbols (`symbols`). It may open several concurrent WS connections (see
+    `ws_urls()`), each of which can carry messages for any of those symbols
+    interleaved, and/or declare periodic REST pollers (see `rest_pollers()`)
+    -- both stay dumb-collector plumbing: URLs, opaque message
+    classification, and raw REST bodies, never parsing into the unified
+    schema (that's normalizer's job).
     """
 
     exchange: str
     segment: str
-    symbol: str
+    symbols: tuple[str, ...]
 
     def ws_urls(self) -> dict[str, str]:
         """Named WS connection URLs this adapter needs open concurrently.
 
         Keys are opaque connection names used only for logging and incident
         payloads (e.g. `{"combined": "..."}` for Binance spot's single
-        combined-stream connection, or `{"public": "...", "market": "..."}`
-        for USDT-M perp's split scheme). The runner opens, reconnects, and
-        backs off each entry independently -- one connection dropping must
-        not interrupt the others.
+        combined-stream connection carrying every symbol in `symbols`, or
+        `{"public": "...", "market": "..."}` for USDT-M perp's split
+        scheme). The runner opens, reconnects, and backs off each entry
+        independently -- one connection dropping must not interrupt the
+        others.
         """
         ...
 
-    async def fetch_snapshot(self) -> dict[str, Any]:
-        """Fetch the REST order-book snapshot used for the bootstrap/reconcile
-        dance. Returns the exchange-native JSON body untouched (dumb collector
-        principle -- no parsing into a unified schema here either, just enough
-        field access to drive the snapshot-sync state machine, e.g.
-        `lastUpdateId`)."""
+    async def fetch_snapshot(self, symbol: str) -> dict[str, Any]:
+        """Fetch the REST order-book snapshot for one symbol, used for that
+        symbol's bootstrap/reconcile dance. Returns the exchange-native JSON
+        body untouched (dumb collector principle -- no parsing into a
+        unified schema here either, just enough field access to drive the
+        snapshot-sync state machine, e.g. `lastUpdateId`). Called
+        independently per symbol -- a connection carrying N symbols runs N
+        independent snapshot dances, one per symbol, the first time that
+        symbol's first depth-diff message arrives (see runner.py)."""
         ...
 
     def stream_type(self, raw_message: dict[str, Any]) -> str:
@@ -73,6 +92,16 @@ class ExchangeAdapter(Protocol):
         from -- classification is driven by the message's own envelope, not
         by connection identity, so a connection that never produces
         'depth_diff' simply never triggers the snapshot-bootstrap dance."""
+        ...
+
+    def symbol_of(self, raw_message: dict[str, Any]) -> str:
+        """Return the (uppercased) symbol a raw WS message belongs to, e.g.
+        'BTCUSDT'. Used by the runner to route the message to that symbol's
+        own Redis stream and to key the per-symbol buffer-until-snapshot-
+        ready state -- a connection multiplexes every symbol in `symbols`,
+        so classification alone (`stream_type()`) is not enough to route a
+        depth_diff, the runner also needs to know *which* symbol's book it
+        belongs to."""
         ...
 
     def depth_update_ids(self, raw_message: dict[str, Any]) -> tuple[int, int]:
