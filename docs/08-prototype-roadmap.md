@@ -27,7 +27,7 @@ work starts.
 
 | Area | Prototype now | MVP target | Gap |
 |---|---|---|---|
-| Instruments | 1 symbol (BTCUSDT spot) | 8 spot + 13 USDT-M perp + 2 COIN-M perp (~23 symbols), see [Binance map](./04-architecture/exchanges/binance.md) | Collector must run many symbols/streams per segment, not one |
+| Instruments | 8 spot symbols (Phase A, implemented) + 1 USDT-M perp symbol at a time | 8 spot + 13 USDT-M perp + 2 COIN-M perp (~23 symbols), see [Binance map](./04-architecture/exchanges/binance.md) | Spot done; USDT-M/COIN-M perp collectors still run one symbol per process, not multiplexed |
 | Segments | Spot only | Spot + USDT-M perp + COIN-M perp | 2 new exchange adapters, 2 new WS connection schemes (`/public`+`/market` vs `dstream`) |
 | Derivatives data | **Implemented for USDT-M perp** (Phase B, see below): `BinanceUsdtmPerpAdapter` (aggTrade/depth/markPrice/forceOrder + OI REST poller), migration `005_derivatives.sql` (`mark_price`, `open_interest`, `liquidations` tables), normalizer parsing + `reference_price_freeze` incident detection (best-effort heuristic, not empirically validated -- see [Next Steps](./06-next-steps.md) item 1). COIN-M perp still has none of this (Phase C). | Funding, mark/index price, OI, liquidations (perp only) | COIN-M perp adapter/schema reuse (Phase C); multi-symbol collection (Phase A still not done -- one symbol per collector instance) |
 | `get_derivatives_metrics` | **Implemented**: `GET /derivatives` + MCP tool, querying `mark_price`/`open_interest`/`liquidations` independently and combining client-side, per `queries.py` | Required MVP tool | None -- closed for USDT-M perp; will need re-verification once COIN-M perp lands (Phase C) if that segment's schema needs match this one's |
@@ -43,13 +43,29 @@ work starts.
 
 ## 3. Suggested build phases
 
-**Phase A — multi-symbol spot.** Extend the collector to hold one combined WS
-connection per (exchange, segment) across all 8 spot symbols instead of one
-symbol per process (per the "≤80 streams, one connection per segment"
-decision in the Binance map). Proves the multi-symbol collector/normalizer
-path without yet touching a new WS protocol. Config-driven symbol list
-(`.env` `SYMBOLS=...` instead of singular `SYMBOL=`) is the natural extension
-of the current `EXCHANGE`/`SEGMENT`/`SYMBOL` pattern.
+**Phase A — multi-symbol spot. STATUS: implemented (see repo history /
+`memory/*.md` for the session trail).** The collector holds one combined WS
+connection per (exchange, segment) across all 8 spot symbols
+(`docker-compose.yml`'s default `SYMBOLS`) instead of one symbol per
+process, per the "≤80 streams, one connection per segment" decision in the
+Binance map. Config-driven symbol list (`.env` `SYMBOLS=...`, comma-separated,
+replacing the old singular `SYMBOL=`) drives `BinanceSpotAdapter.ws_urls()`
+(`src/exchanges/binance/spot.py`), which builds one `/stream?streams=...` URL
+carrying every symbol's `@trade`+`@depth@100ms` streams interleaved.
+`src/collector/runner.py`'s buffer-until-snapshot-ready dance is keyed
+per-(connection, symbol) instead of per-connection, so each symbol's
+order-book bootstrap runs independently even though they share one WS
+connection. The normalizer side is *not* itself multi-symbol -- its
+order-book/incident state (`NormalizerContext`) stays scoped to one symbol
+per process by design, so `docker-compose.yml` instead runs one
+`normalizer-<symbol>` container per spot symbol (8 static service blocks),
+all reading from the per-symbol Redis streams the single multi-symbol
+collector publishes. USDT-M perp (`SEGMENT=usdtm`) is unaffected and stays
+single-symbol-per-process (`src/exchanges/binance/usdtm.py` not
+generalized this round -- `collector/main.py` raises if given more than one
+symbol under `usdtm`); running spot's 8-way setup and a usdtm slice
+concurrently still means manually duplicating services, same limitation as
+before this phase, just narrower in scope now (spot only).
 
 **Phase B — USDT-M perp. STATUS: implemented (see repo history / `memory/*.md` for the session trail).** New adapter against the `/public`+`/market`+`/private`
 scheme: trades, L2 order book (same bootstrap/reconciliation logic, `pu`-based

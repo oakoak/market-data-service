@@ -7,16 +7,19 @@ not a 1:1 clone. Full context: `docs/` (start with `docs/01-idea-and-market.md`,
 
 ## Current state
 
-Local prototype only, single symbol per segment, no auth, no cache layer:
-**Binance spot BTCUSDT** (trades + L2 order book) and, since Phase B,
-**Binance USDT-M perp** (trades/aggTrade + L2 order book + funding/mark/index
-price + open interest + liquidations, one symbol at a time via `SEGMENT=usdtm`).
-COIN-M perp (Phase C) is not implemented. Multi-symbol collection (Phase A) is
-also still not implemented — one collector/normalizer process still handles
-exactly one (exchange, segment, symbol). Gap vs. full MVP scope tracked in
-`docs/08-prototype-roadmap.md`. Don't assume multi-exchange, multi-instrument,
-multi-segment-at-once, or auth exist — check the roadmap doc before building
-on top of them.
+Local prototype only, no auth, no cache layer: **Binance spot**, now
+multi-symbol as of Phase A (8 symbols by default, `SYMBOLS=...` env var --
+`docs/04-architecture/exchanges/binance.md`'s spot list) collected by one
+`collector` process over one combined WS connection, with one
+`normalizer-<symbol>` process per symbol (order-book/incident state is still
+scoped per symbol by design, see `src/normalizer/consumer.py`). Also, since
+Phase B, **Binance USDT-M perp** (trades/aggTrade + L2 order book +
+funding/mark/index price + open interest + liquidations) -- still one symbol
+at a time via `SEGMENT=usdtm`, not generalized to multi-symbol this round.
+COIN-M perp (Phase C) is not implemented. Gap vs. full MVP scope tracked in
+`docs/08-prototype-roadmap.md`. Don't assume multi-exchange, multi-segment-
+at-once, multi-symbol USDT-M/COIN-M, or auth exist — check the roadmap doc
+before building on top of them.
 
 ## Stack (see docs/04-architecture/01-stack.md for rationale)
 

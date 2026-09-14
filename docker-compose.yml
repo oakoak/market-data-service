@@ -1,7 +1,35 @@
 # Local prototype stack: redis (broker) + clickhouse (storage) + collector + normalizer + api.
 #
-# Deliberately cut down per docs/03-mvp-scope.md: single exchange/segment/symbol
-# (Binance spot BTCUSDT). See docs/07-local-dev.md.
+# Deliberately cut down per docs/03-mvp-scope.md: single exchange/segment
+# (Binance spot). See docs/07-local-dev.md.
+#
+# Phase A (2026-09, docs/08-prototype-roadmap.md): multi-symbol spot. ONE
+# `collector` container now multiplexes every symbol in `SYMBOLS` over one
+# combined WS connection (src/collector/config.py, src/exchanges/binance/spot.py).
+# `normalizer`, by contrast, is still architecturally one-symbol-per-process
+# (its order-book state and incident tracking are scoped per symbol,
+# src/normalizer/consumer.py `NormalizerContext`) -- so instead of one
+# normalizer container, this file runs one named `normalizer-<symbol>`
+# service per spot symbol, each with its own `SYMBOL`/`CONSUMER_GROUP`,
+# all reading from the streams the single multi-symbol collector publishes.
+# Default symbol list matches docs/04-architecture/exchanges/binance.md's
+# spot instrument list (8 symbols); override with `SYMBOLS=...` in `.env` to
+# collect a subset -- but note the 8 `normalizer-*` services below are still
+# static per-symbol blocks (Compose has no clean way to spin up N replicas
+# with N different SYMBOL values), so removing a symbol from `SYMBOLS`
+# without removing its matching `normalizer-*` block just leaves that
+# consumer idle on an empty stream, and *adding* a 9th symbol needs a new
+# `normalizer-*` block added here by hand -- flagged as a known rough edge,
+# not solved in this pass (see docs/08-prototype-roadmap.md Phase A).
+#
+# USDT-M perp (`SEGMENT=usdtm`) is unaffected by this and stays exactly as
+# before: single-symbol-per-process, still requires manually pointing this
+# same `collector`/`normalizer-btcusdt`-shaped pair at `SEGMENT=usdtm` with
+# a single `SYMBOLS=<one symbol>` (collector/main.py raises if usdtm gets
+# more than one symbol) -- running spot's 8-way multi-symbol setup
+# concurrently with a usdtm slice still means duplicating the stack, exactly
+# as already noted below in .env.example (not solved here, out of Phase A
+# scope per docs/08-prototype-roadmap.md's phase ordering).
 #
 # Cross-platform note (Windows Docker Desktop + Linux dev, same compose file):
 # stateful data (Redis, ClickHouse) lives in named volumes, not host bind-mounts,
@@ -111,7 +139,7 @@ services:
       REDIS_STREAM_DB: ${REDIS_STREAM_DB:-1}
       EXCHANGE: ${EXCHANGE:-binance}
       SEGMENT: ${SEGMENT:-spot}
-      SYMBOL: ${SYMBOL:-BTCUSDT}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,BTCFDUSD,ETHFDUSD}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       REDIS_STREAM_MAXLEN: ${REDIS_STREAM_MAXLEN:-1000000}
       BACKOFF_INITIAL_S: ${BACKOFF_INITIAL_S:-1}
@@ -127,17 +155,23 @@ services:
         <<: *loki-log-options
         loki-external-labels: "service=collector,project=market-data"
 
-  normalizer:
+  # Shared shape for every per-symbol normalizer below -- only `SYMBOL`
+  # differs between them (see header comment: one normalizer process per
+  # symbol, matching NormalizerContext's per-symbol order-book/incident
+  # state). `CONSUMER_GROUP` is left unset here so each falls back to
+  # normalizer/config.py's default (`normalizer:{exchange}:{segment}:{symbol}`),
+  # which is already unique per symbol -- no override needed.
+  normalizer-btcusdt: &normalizer-base
     build:
       context: .
       dockerfile: ./src/normalizer/Dockerfile
     restart: unless-stopped
-    environment:
+    environment: &normalizer-base-env
       REDIS_URL: redis://redis:6379
       REDIS_STREAM_DB: ${REDIS_STREAM_DB:-1}
       EXCHANGE: ${EXCHANGE:-binance}
       SEGMENT: ${SEGMENT:-spot}
-      SYMBOL: ${SYMBOL:-BTCUSDT}
+      SYMBOL: BTCUSDT
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
@@ -153,7 +187,84 @@ services:
       driver: loki
       options:
         <<: *loki-log-options
-        loki-external-labels: "service=normalizer,project=market-data"
+        loki-external-labels: "service=normalizer,project=market-data,symbol=btcusdt"
+
+  normalizer-ethusdt:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: ETHUSDT
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=ethusdt"
+
+  normalizer-solusdt:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: SOLUSDT
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=solusdt"
+
+  normalizer-xrpusdt:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: XRPUSDT
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=xrpusdt"
+
+  normalizer-bnbusdt:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: BNBUSDT
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=bnbusdt"
+
+  normalizer-dogeusdt:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: DOGEUSDT
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=dogeusdt"
+
+  normalizer-btcfdusd:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: BTCFDUSD
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=btcfdusd"
+
+  normalizer-ethfdusd:
+    <<: *normalizer-base
+    environment:
+      <<: *normalizer-base-env
+      SYMBOL: ETHFDUSD
+    logging:
+      driver: loki
+      options:
+        <<: *loki-log-options
+        loki-external-labels: "service=normalizer,project=market-data,symbol=ethfdusd"
 
   api:
     build:
